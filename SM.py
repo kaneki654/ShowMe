@@ -5,7 +5,12 @@ import socket
 import json
 import threading
 import concurrent.futures
+import shutil
+import subprocess
+import ssl
+import secrets
 from datetime import datetime
+from pathlib import Path
 import re
 import ipaddress
 from ipaddress import ip_address
@@ -50,18 +55,41 @@ C = {
 }
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "GhostRecon/2.0"})
+if os.getenv("NVD_API_KEY"):
+    SESSION.headers.update({"apiKey": os.getenv("NVD_API_KEY")})
 TIMEOUT = 8
 COMMON_PORTS = [
     21,22,23,25,53,80,110,111,135,139,143,443,445,
     465,587,993,995,1433,1521,3306,3389,5432,5900,
     6379,8080,8443,8888,9200,9300,27017,27018,6667,
 ]
+TOP_100_PORTS = [
+    7,9,13,21,22,23,25,26,37,53,79,80,81,88,106,110,111,113,119,135,139,143,
+    144,179,199,389,427,443,444,445,465,513,514,515,543,544,548,554,587,631,
+    646,873,990,993,995,1025,1026,1027,1028,1029,1110,1433,1720,1723,1755,
+    1900,2000,2001,2049,2121,2717,3000,3128,3306,3389,3986,4899,5000,5009,
+    5051,5060,5101,5190,5357,5432,5631,5666,5800,5900,6000,6001,6646,7070,
+    8000,8008,8009,8080,8081,8443,8888,9100,9999,10000,32768,49152,49153,
+    49154,49155,49156,49157,
+]
+NVD_CACHE_PATH = Path.home() / ".cache" / "showme" / "nvd_cvss.json"
+NVD_CACHE_TTL = 7 * 24 * 3600
+NVD_API_KEY = os.getenv("NVD_API_KEY")
+WORDLIST_PATH = Path(__file__).resolve().parent / "wordlists" / "subdomains.txt"
+INLINE_FALLBACK_WORDLIST = [
+    "www","mail","webmail","smtp","pop","pop3","imap","ftp","sftp","ssh","vpn",
+    "remote","portal","api","dev","staging","stage","test","qa","uat","prod",
+    "admin","administrator","root","dashboard","cpanel","whm","webdisk","ns1",
+    "ns2","dns","mx","mx1","blog","shop","store","cdn","static","assets","img",
+    "images","media","video","download","files","docs","help","support","kb",
+]
 SEVERITY = {
-    "critical": ("bold red",    "[CRIT]"),
-    "high":     ("bold #FF6600","[HIGH]"),
-    "medium":   ("bold yellow", "[MED] "),
-    "low":      ("bold green",  "[LOW] "),
-    "info":     ("bold cyan",   "[INFO]"),
+    "critical": ("bold red",       "[CRIT]"),
+    "high":     ("bold #FF6600",   "[HIGH]"),
+    "medium":   ("bold yellow",    "[MED] "),
+    "low":      ("bold green",     "[LOW] "),
+    "info":     ("bold cyan",      "[INFO]"),
+    "unknown":  ("dim white",      "[ ?  ]"),
 }
 BANNER = r"""
  _________.__                    _____
@@ -153,6 +181,7 @@ _HOST_MIN_INTERVAL = {
     "ip-api.com": 0.3,
     "ipwho.is": 0.3,
     "dns.google": 0.1,
+    "services.nvd.nist.gov": 0.6 if NVD_API_KEY else 6.0,
 }
 def _host_of(url: str) -> str:
     try:
@@ -259,22 +288,111 @@ def mod_shodan(ip: str) -> dict:
     if vulns:
         console.print()
         console.print(f"  [bold {C['danger']}]>> {len(vulns)} CVE(s) FOUND <<[/]")
+        cvss = fetch_cvss_many(sorted(vulns))
         for cve in sorted(vulns):
-            sev_style, sev_label = _cve_severity(cve)
-            console.print(f"    [{sev_style}]{sev_label}[/] [{C['white']}]{cve}[/]  "
+            sev_style, sev_label = _cve_severity(cve, cvss)
+            score = cvss.get(cve, {}).get("score")
+            score_txt = f"[dim](CVSS {score})[/] " if isinstance(score, (int, float)) else ""
+            console.print(f"    [{sev_style}]{sev_label}[/] [{C['white']}]{cve}[/]  {score_txt}"
                           f"[link=https://nvd.nist.gov/vuln/detail/{cve}][dim u]nvd.nist.gov[/][/link]")
     else:
         print_kv("CVEs", "None in database", C['accent'])
     return data
-def _cve_severity(cve_id: str) -> tuple:
-    num = int(cve_id.split("-")[-1]) % 10
-    if num >= 8:
-        return SEVERITY["critical"]
-    elif num >= 6:
-        return SEVERITY["high"]
-    elif num >= 4:
-        return SEVERITY["medium"]
-    return SEVERITY["low"]
+def _cve_severity(cve_id, cvss_dict=None):
+    if cvss_dict:
+        entry = cvss_dict.get(cve_id)
+        if entry:
+            sev = str(entry.get("severity", "")).lower()
+            if sev in SEVERITY:
+                return SEVERITY[sev]
+    return SEVERITY["unknown"]
+def fetch_cvss(cve_id, cache):
+    now = time.time()
+    cached = cache.get(cve_id)
+    if cached and (now - cached.get("fetched", 0)) < NVD_CACHE_TTL:
+        return cached if cached.get("severity") else None
+    data = safe_get("https://services.nvd.nist.gov/rest/json/cves/2.0",
+                    params={"cveId": cve_id}, timeout=15)
+    if not isinstance(data, dict) or "_error" in data or "_http_error" in data:
+        return None
+    if data.get("totalResults", 0) == 0:
+        cache[cve_id] = {"fetched": now, "severity": None, "score": None, "vector": None}
+        return None
+    vulns = data.get("vulnerabilities") or []
+    if not vulns:
+        return None
+    metrics = (vulns[0].get("cve") or {}).get("metrics") or {}
+    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        m = metrics.get(key)
+        if m:
+            cdata = (m[0] or {}).get("cvssData") or {}
+            score = cdata.get("baseScore")
+            sev_raw = cdata.get("baseSeverity") or (m[0] or {}).get("baseSeverity")
+            sev = str(sev_raw).lower() if sev_raw else None
+            if sev == "none":
+                sev = "info"
+            if sev not in SEVERITY:
+                sev = "high" if sev == "high" else sev if sev in SEVERITY else None
+            if not sev and isinstance(score, (int, float)):
+                if score >= 9.0:   sev = "critical"
+                elif score >= 7.0: sev = "high"
+                elif score >= 4.0: sev = "medium"
+                elif score > 0.0:  sev = "low"
+                else:              sev = "info"
+            vector = cdata.get("vectorString")
+            entry = {"fetched": now, "severity": sev, "score": score, "vector": vector}
+            cache[cve_id] = entry
+            return entry
+    cache[cve_id] = {"fetched": now, "severity": None, "score": None, "vector": None}
+    return None
+def fetch_cvss_many(cve_ids, cap=10):
+    cache = _cache_load()
+    now = time.time()
+    result = {}
+    misses = []
+    for cve in cve_ids:
+        c = cache.get(cve)
+        if c and (now - c.get("fetched", 0)) < NVD_CACHE_TTL:
+            if c.get("severity"):
+                result[cve] = c
+        else:
+            misses.append(cve)
+    if not misses:
+        return result
+    rate = _HOST_MIN_INTERVAL.get("services.nvd.nist.gov", 6.0)
+    est_seconds = int(len(misses) * rate)
+    to_fetch = misses
+    if len(misses) > cap:
+        console.print(f"  [{C['warn']}]{len(misses)} uncached CVE(s). Fresh NVD fetch takes ~{est_seconds}s.[/]")
+        try:
+            if not Confirm.ask(f"  [{C['info']}]?[/] Fetch CVSS for all {len(misses)}?", default=False):
+                to_fetch = misses[:cap]
+                console.print(f"  [dim]Limiting to first {cap} CVEs.[/]")
+        except (KeyboardInterrupt, EOFError):
+            to_fetch = misses[:cap]
+    try:
+        with Progress(
+            SpinnerColumn(spinner_name="dots2", style=f"bold {C['accent']}"),
+            TextColumn(f"[{C['info']}]Fetching CVSS from NVD[/]"),
+            BarColumn(bar_width=30, style=C['muted'], complete_style=C['accent']),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as prog:
+            task = prog.add_task("", total=len(to_fetch))
+            for cve in to_fetch:
+                try:
+                    entry = fetch_cvss(cve, cache)
+                    if entry and entry.get("severity"):
+                        result[cve] = entry
+                except Exception:
+                    pass
+                prog.advance(task)
+    except KeyboardInterrupt:
+        console.print(f"  [{C['warn']}]NVD fetch interrupted, showing partial data.[/]")
+    _cache_save(cache)
+    return result
 def mod_ipwho(ip: str):
     section_header("NETWORK / WHOIS", ">")
     data = safe_get(f"https://ipwho.is/{ip}")
@@ -312,25 +430,110 @@ def mod_dns(domain: str):
         if answers:
             print_kv(rtype, answers, C['accent'] if rtype == "A" else C['white'])
         time.sleep(0.08)
-def mod_subdomains(domain: str):
-    section_header("SUBDOMAIN ENUMERATION  (crt.sh)", ">")
+def mod_subdomains_passive(domain):
     data = safe_get("https://crt.sh/", params={"q": f"%.{domain}", "output": "json"})
     if isinstance(data, dict):
-        console.print("  [dim]crt.sh error or no data[/]")
         return []
     subs = set()
     for entry in data:
-        for name in entry.get("name_value","").splitlines():
-            name = name.strip().lstrip("*.")
-            if domain in name:
-                subs.add(name.lower())
-    subs = sorted(subs)
+        for name in entry.get("name_value", "").splitlines():
+            name = name.strip().lstrip("*.").lower()
+            if name.endswith(domain) and name != domain:
+                subs.add(name)
+    return sorted(subs)
+def _detect_wildcard(domain):
+    try:
+        r1 = socket.gethostbyname(f"{secrets.token_hex(8)}.{domain}")
+    except Exception:
+        return (False, None)
+    try:
+        r2 = socket.gethostbyname(f"{secrets.token_hex(8)}.{domain}")
+    except Exception:
+        return (True, r1)
+    if r1 == r2:
+        return (True, r1)
+    return (True, None)
+def _load_wordlist(path=None):
+    p = Path(path) if path else WORDLIST_PATH
+    try:
+        if p.exists():
+            words = []
+            for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    words.append(line)
+            if words:
+                return words
+    except Exception:
+        pass
+    return list(INLINE_FALLBACK_WORDLIST)
+def mod_subdomains_bruteforce(domain, wordlist_path=None, workers=40):
+    words = _load_wordlist(wordlist_path)
+    found = []
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(2.0)
+    try:
+        with Progress(
+            SpinnerColumn(spinner_name="dots2", style=f"bold {C['accent']}"),
+            TextColumn(f"[{C['info']}]Brute-forcing {len(words)} names[/]"),
+            BarColumn(bar_width=30, style=C['muted'], complete_style=C['accent']),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as prog:
+            task = prog.add_task("", total=len(words))
+            def try_one(w):
+                host = f"{w}.{domain}"
+                try:
+                    ip = socket.gethostbyname(host)
+                    return (host, ip)
+                except Exception:
+                    return None
+                finally:
+                    prog.advance(task)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                try:
+                    for result in ex.map(try_one, words):
+                        if result:
+                            found.append(result)
+                except KeyboardInterrupt:
+                    console.print(f"\n  [{C['warn']}]Brute-force interrupted, showing partial results.[/]")
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+    found.sort()
+    return found
+def mod_subdomains(domain, bruteforce=True, wordlist_path=None):
+    section_header("SUBDOMAIN ENUMERATION", ">")
+    console.print(f"  [dim]Detecting wildcard DNS...[/]")
+    is_wc, wc_ip = _detect_wildcard(domain)
+    if is_wc:
+        msg = f"Wildcard DNS detected (IP={wc_ip})" if wc_ip else "Unstable wildcard DNS detected"
+        console.print(f"  [{C['warn']}]{msg}. Brute-force skipped to avoid false positives.[/]")
+        bruteforce = False
+    else:
+        console.print(f"  [dim]No wildcard.[/]")
+    console.print(f"  [dim]Querying crt.sh (passive)...[/]")
+    passive = mod_subdomains_passive(domain)
+    brute = []
+    if bruteforce:
+        brute = mod_subdomains_bruteforce(domain, wordlist_path=wordlist_path)
+    passive_set = set(passive)
+    brute_set = {h for h, _ip in brute}
+    all_names = sorted(passive_set | brute_set)
     tree = Tree(f"[bold {C['accent']}]{domain}[/]")
-    for s in subs:
-        tree.add(f"[{C['cyan']}]{s}[/]")
-    console.print(Padding(tree, (0,4)))
-    console.print(f"\n  [dim]Total: {len(subs)} subdomains[/]")
-    return subs
+    for name in all_names:
+        tags = []
+        if name in passive_set: tags.append(f"[dim cyan][crt.sh][/]")
+        if name in brute_set:   tags.append(f"[dim green][brute][/]")
+        tree.add(f"[{C['cyan']}]{name}[/]  {' '.join(tags)}")
+    console.print(Padding(tree, (0, 4)))
+    console.print(
+        f"\n  [dim]Total: {len(all_names)} unique "
+        f"(crt.sh={len(passive_set)}, brute={len(brute_set)}, "
+        f"overlap={len(passive_set & brute_set)})[/]"
+    )
+    return all_names
 def mod_reverse_ip(ip: str):
     section_header("REVERSE IP LOOKUP  (hackertarget)", ">")
     text = safe_get(f"https://api.hackertarget.com/reverseiplookup/?q={ip}", json_resp=False)
@@ -359,9 +562,37 @@ def mod_host_records(domain: str):
         if len(parts) == 2:
             t.add_row(parts[0].strip(), parts[1].strip())
     console.print(Padding(t, (0,2)))
-def mod_port_scan(ip: str, ports: list = None, grab_banner: bool = True):
-    section_header("PORT SCANNER  (raw socket)", ">")
-    ports = ports or COMMON_PORTS
+_NMAP_PATH_CACHE = [None, False]
+def _nmap_path():
+    if not _NMAP_PATH_CACHE[1]:
+        _NMAP_PATH_CACHE[0] = shutil.which("nmap")
+        _NMAP_PATH_CACHE[1] = True
+    return _NMAP_PATH_CACHE[0]
+def _probe(port, sock):
+    try:
+        if port in (80, 8080, 8888, 8000, 8081, 81):
+            sock.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
+        elif port == 6379:
+            sock.sendall(b"PING\r\n")
+        elif port in (443, 8443, 993, 995):
+            return "[TLS]"
+        sock.settimeout(0.8)
+        raw = sock.recv(512)
+        if not raw:
+            return ""
+        if port == 3306 and len(raw) > 4:
+            raw = raw[4:]
+        text = raw.decode(errors="replace").strip()
+        return text.splitlines()[0][:80] if text else ""
+    except Exception:
+        return ""
+def mod_port_scan(ip, port_spec=None, grab_banner=True):
+    try:
+        ports = _parse_port_spec(port_spec) if port_spec not in (None, "") else list(COMMON_PORTS)
+    except ValueError as e:
+        console.print(f"  [{C['danger']}]Invalid port spec: {e}[/]")
+        return []
+    section_header(f"PORT SCANNER  [socket]  ({len(ports)} ports)", ">")
     open_ports = []
     with Progress(
         SpinnerColumn(spinner_name="arc", style=f"bold {C['accent']}"),
@@ -375,22 +606,14 @@ def mod_port_scan(ip: str, ports: list = None, grab_banner: bool = True):
         def scan_one(port):
             try:
                 with socket.create_connection((ip, port), timeout=1.2) as s:
-                    banner = ""
-                    if grab_banner:
-                        try:
-                            if port in (80, 8080, 8888):
-                                s.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
-                            s.settimeout(0.8)
-                            raw = s.recv(256).decode(errors="replace").strip()
-                            banner = raw.splitlines()[0][:80] if raw else ""
-                        except Exception:
-                            pass
+                    banner = _probe(port, s) if grab_banner else ""
                     return (port, True, banner)
             except Exception:
                 return (port, False, "")
             finally:
                 prog.advance(task)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=60) as ex:
+        workers = min(100, max(20, len(ports)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             try:
                 for result in ex.map(scan_one, ports):
                     port, is_open, banner = result
@@ -399,24 +622,286 @@ def mod_port_scan(ip: str, ports: list = None, grab_banner: bool = True):
             except KeyboardInterrupt:
                 console.print(f"\n  [{C['warn']}]Port scan interrupted! Showing partial results...[/]")
     open_ports.sort()
+    _render_port_table(open_ports)
+    return open_ports
+def _render_port_table(open_ports):
     if not open_ports:
         console.print(f"  [{C['warn']}]No open ports detected (firewall/filtered)[/]")
-        return []
+        return
     t = Table(box=box.MINIMAL, show_header=True, header_style=f"bold {C['accent']}", padding=(0,2))
     t.add_column("PORT",    style=C['cyan'],    width=8)
-    t.add_column("SERVICE", style=C['purple'],  width=14)
+    t.add_column("SERVICE", style=C['purple'],  width=20)
     t.add_column("STATE",   style=C['accent'],  width=8)
     t.add_column("BANNER",  style=C['muted'])
     for port, banner in open_ports:
         svc = _svc(port)
-        t.add_row(str(port), svc, "OPEN", banner[:60] if banner else "")
+        t.add_row(str(port), svc, "OPEN", banner[:70] if banner else "")
     console.print(Padding(t, (0,2)))
+def mod_port_scan_nmap(ip, port_spec=None):
+    nmap = _nmap_path()
+    if not nmap:
+        return mod_port_scan(ip, port_spec)
+    spec = str(port_spec).strip() if port_spec else ""
+    if not spec or spec.lower() in ("common", "default"):
+        spec = ",".join(str(p) for p in COMMON_PORTS)
+    elif spec.lower() == "top100":
+        spec = ",".join(str(p) for p in TOP_100_PORTS)
+    elif spec.lower() == "all":
+        spec = "1-65535"
+    section_header(f"PORT SCANNER  [nmap -sV]  (ports {spec[:40]}{'...' if len(spec) > 40 else ''})", ">")
+    open_ports = []
+    raw_output = ""
+    try:
+        with Progress(
+            SpinnerColumn(spinner_name="arc", style=f"bold {C['accent']}"),
+            TextColumn(f"[{C['info']}]Running nmap -sV (this may take a while)[/]"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as prog:
+            prog.add_task("", total=None)
+            proc_g = subprocess.run(
+                [nmap, "-Pn", "-sV", "-T3", "--open", "-oG", "-", "-p", spec, ip],
+                capture_output=True, text=True, timeout=600, check=False
+            )
+            proc_n = subprocess.run(
+                [nmap, "-Pn", "-sV", "-T3", "--open", "-p", spec, ip],
+                capture_output=True, text=True, timeout=600, check=False
+            )
+            raw_output = proc_n.stdout or ""
+            for line in (proc_g.stdout or "").splitlines():
+                if "Ports:" not in line:
+                    continue
+                _, _, ports_part = line.partition("Ports:")
+                for entry in ports_part.split(","):
+                    m = re.match(r"\s*(\d+)/open/tcp//([^/]*)//([^/]*)//", entry)
+                    if not m:
+                        continue
+                    port = int(m.group(1))
+                    svc = m.group(2).strip()
+                    version = m.group(3).replace("\\x2f", "/").strip()
+                    banner = f"{svc} {version}".strip() if svc or version else ""
+                    open_ports.append((port, banner))
+    except subprocess.TimeoutExpired:
+        console.print(f"  [{C['warn']}]nmap timed out after 10 minutes. Partial results may be empty.[/]")
+    except KeyboardInterrupt:
+        console.print(f"\n  [{C['warn']}]nmap interrupted![/]")
+    except Exception as e:
+        console.print(f"  [{C['danger']}]nmap error: {e}[/]")
+        return mod_port_scan(ip, port_spec)
+    open_ports.sort()
+    _render_port_table(open_ports)
+    if raw_output.strip():
+        trimmed = "\n".join(raw_output.splitlines()[:40])
+        console.print(Panel(trimmed, title="[dim]nmap raw output[/]", border_style=C['muted'], padding=(0,1)))
     return open_ports
+def mod_port_scan_auto(ip, port_spec=None, grab_banner=True, force_socket=False):
+    if _nmap_path() and not force_socket:
+        return mod_port_scan_nmap(ip, port_spec)
+    return mod_port_scan(ip, port_spec, grab_banner=grab_banner)
+_TLS_VERSIONS = [
+    ("TLSv1",   "TLSv1"),
+    ("TLSv1.1", "TLSv1_1"),
+    ("TLSv1.2", "TLSv1_2"),
+    ("TLSv1.3", "TLSv1_3"),
+]
+_WEAK_CIPHER_RE = re.compile(r"RC4|3DES|MD5|EXPORT|NULL|DES-CBC", re.IGNORECASE)
+def _tls_format_cert_time(s):
+    try:
+        secs = ssl.cert_time_to_seconds(s)
+        return datetime.utcfromtimestamp(secs).strftime("%Y-%m-%d %H:%M:%S UTC"), secs
+    except Exception:
+        return s, None
+def _tls_probe_version(host, port, version_name):
+    try:
+        ver_enum = getattr(ssl.TLSVersion, version_name)
+    except (AttributeError, ValueError):
+        return "DISABLED IN CLIENT", None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.minimum_version = ver_enum
+            ctx.maximum_version = ver_enum
+        except (ValueError, OSError):
+            return "DISABLED IN CLIENT", None
+    except Exception:
+        return "DISABLED IN CLIENT", None
+    try:
+        with socket.create_connection((host, port), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                return "SUPPORTED", ss.cipher()
+    except ssl.SSLError as e:
+        msg = str(e)
+        if "NO_PROTOCOLS_AVAILABLE" in msg or "no protocols" in msg.lower():
+            return "DISABLED IN CLIENT", None
+        return "NOT OFFERED", None
+    except (socket.timeout, ConnectionError, OSError):
+        return "NOT OFFERED", None
+def mod_tls(host, port=443, probe_versions=True):
+    section_header(f"TLS / CERTIFICATE  ({host}:{port})", ">")
+    result = {"host": host, "port": port}
+    ctx_verify = ssl.create_default_context()
+    verified = False
+    verify_err = ""
+    negotiated = {}
+    cert = None
+    try:
+        with socket.create_connection((host, port), timeout=8) as sock:
+            with ctx_verify.wrap_socket(sock, server_hostname=host) as ss:
+                verified = True
+                negotiated["version"] = ss.version()
+                negotiated["cipher"] = ss.cipher()
+                c = ss.getpeercert()
+                if c:
+                    cert = c
+    except ssl.SSLCertVerificationError as e:
+        verify_err = f"{e.reason or str(e)}"
+    except (socket.timeout, ConnectionError, OSError, ssl.SSLError) as e:
+        console.print(f"  [{C['danger']}]TLS connect failed: {e}[/]")
+        return {"error": str(e)}
+    if not cert:
+        try:
+            import tempfile
+            with socket.create_connection((host, port), timeout=8) as sock:
+                ctx_perm = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx_perm.check_hostname = False
+                ctx_perm.verify_mode = ssl.CERT_NONE
+                with ctx_perm.wrap_socket(sock, server_hostname=host) as ss:
+                    if not negotiated.get("version"):
+                        negotiated["version"] = ss.version()
+                    if not negotiated.get("cipher"):
+                        negotiated["cipher"] = ss.cipher()
+                    der = ss.getpeercert(binary_form=True)
+                    if der:
+                        pem = ssl.DER_cert_to_PEM_cert(der)
+                        with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as tf:
+                            tf.write(pem)
+                            tmp_path = tf.name
+                        try:
+                            cert = ssl._ssl._test_decode_cert(tmp_path)
+                        except Exception:
+                            cert = None
+                        finally:
+                            try:
+                                os.unlink(tmp_path)
+                            except Exception:
+                                pass
+        except Exception as e:
+            console.print(f"  [{C['warn']}]Permissive handshake failed: {e}[/]")
+    result["verified"] = verified
+    if not verified and verify_err:
+        print_kv("Verification", f"FAILED — {verify_err}", C['danger'])
+    else:
+        print_kv("Verification", "OK" if verified else "UNKNOWN", C['accent'] if verified else C['warn'])
+    if negotiated.get("version"):
+        print_kv("Negotiated TLS", negotiated["version"], C['accent'])
+    cipher_tuple = negotiated.get("cipher")
+    if cipher_tuple:
+        cname, cver, cbits = cipher_tuple
+        weak = bool(_WEAK_CIPHER_RE.search(cname))
+        print_kv("Cipher", f"{cname} ({cbits} bits)", C['danger'] if weak else C['cyan'])
+        if weak:
+            console.print(f"  [{C['danger']}]  -> WEAK cipher flagged[/]")
+        result["cipher"] = cname
+    if cert and isinstance(cert, dict) and "_der_only" not in cert:
+        subj = dict(x[0] for x in cert.get("subject", ()) if x)
+        issuer = dict(x[0] for x in cert.get("issuer", ()) if x)
+        print_kv("Subject CN", subj.get("commonName", "-"), C['white'])
+        print_kv("Issuer",     f"{issuer.get('commonName','-')} ({issuer.get('organizationName','-')})", C['purple'])
+        sans = [v for t, v in cert.get("subjectAltName", ()) if t == "DNS"]
+        if sans:
+            print_kv("SANs", sans, C['cyan'])
+        nb, _ = _tls_format_cert_time(cert.get("notBefore", ""))
+        na, na_secs = _tls_format_cert_time(cert.get("notAfter", ""))
+        print_kv("Not Before", nb, C['muted'])
+        if na_secs is not None:
+            days_left = int((na_secs - time.time()) // 86400)
+            color = C['danger'] if days_left <= 0 else (C['warn'] if days_left < 30 else C['accent'])
+            print_kv("Not After", f"{na}  ({days_left} days left)", color)
+            result["days_left"] = days_left
+        else:
+            print_kv("Not After", na, C['muted'])
+        result["subject_cn"] = subj.get("commonName")
+        result["issuer"] = issuer.get("commonName")
+        result["sans"] = sans
+    elif cert and "_der_only" in cert:
+        print_kv("Certificate", "Present (DER only, parser unavailable)", C['warn'])
+    else:
+        print_kv("Certificate", "Not retrievable", C['warn'])
+    if probe_versions:
+        console.print()
+        t = Table(box=box.MINIMAL, show_header=True, header_style=f"bold {C['accent']}", padding=(0,2))
+        t.add_column("VERSION", style=C['cyan'], width=10)
+        t.add_column("STATUS",  style=C['white'], width=24)
+        t.add_column("CIPHER (if supported)", style=C['muted'])
+        version_results = {}
+        for display, attr in _TLS_VERSIONS:
+            status, cipher = _tls_probe_version(host, port, attr)
+            if status == "SUPPORTED":
+                is_deprecated = attr in ("TLSv1", "TLSv1_1")
+                style = C['danger'] if is_deprecated else C['accent']
+                label = f"[{style}]{'[SUPPORTED]' + (' DEPRECATED' if is_deprecated else '')}[/]"
+            elif status == "DISABLED IN CLIENT":
+                label = f"[dim]{status}[/]"
+            else:
+                label = f"[{C['muted']}]{status}[/]"
+            cipher_txt = cipher[0] if cipher else ""
+            t.add_row(display, label, cipher_txt)
+            version_results[display] = status
+        console.print(Padding(t, (0, 2)))
+        result["versions"] = version_results
+    return result
 def _svc(port: int) -> str:
     try:
         return socket.getservbyport(port)
     except Exception:
         return "unknown"
+def _parse_port_spec(s):
+    if s is None:
+        return list(COMMON_PORTS)
+    s = str(s).strip().lower()
+    if not s or s in ("common", "default"):
+        return list(COMMON_PORTS)
+    if s == "top100":
+        return list(TOP_100_PORTS)
+    if s == "all":
+        return list(range(1, 65536))
+    ports = set()
+    for chunk in s.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            lo, hi = chunk.split("-", 1)
+            lo_i, hi_i = int(lo), int(hi)
+            if lo_i < 1 or hi_i > 65535 or lo_i > hi_i:
+                raise ValueError(f"invalid range: {chunk}")
+            ports.update(range(lo_i, hi_i + 1))
+        else:
+            n = int(chunk)
+            if n < 1 or n > 65535:
+                raise ValueError(f"invalid port: {chunk}")
+            ports.add(n)
+    return sorted(ports)
+def _cache_load():
+    try:
+        if NVD_CACHE_PATH.exists():
+            with NVD_CACHE_PATH.open("r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception:
+        pass
+    return {}
+def _cache_save(cache):
+    try:
+        NVD_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with NVD_CACHE_PATH.open("w") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass
 def mod_http_headers(target: str):
     section_header("HTTP HEADERS", ">")
     for scheme in ("https","http"):
@@ -453,6 +938,9 @@ def mod_whois(domain: str):
             if v.strip():
                 print_kv(k.strip(), v.strip())
 def mass_scan(targets: list):
+    # NOTE: NVD CVSS enrichment is intentionally NOT wired into mass_scan. With the
+    # unauthenticated NVD rate limit (~6s/req), bulk-scanning N targets with M CVEs
+    # each would block for minutes. CVSS labels live only in mod_shodan (DEEP SCAN / CVE CHECK).
     os.system("clear" if os.name != "nt" else "cls")
     console.print(Align.center(MINI_BANNER))
     console.print()
@@ -580,10 +1068,17 @@ def deep_scan(target: str):
     spinner_task("Network WHOIS",         mod_ipwho,       ip);   time.sleep(0.1)
     spinner_task("BGPView",               mod_bgpview,     ip);   time.sleep(0.1)
     spinner_task("Reverse IP",            mod_reverse_ip,  ip);   time.sleep(0.1)
-    mod_port_scan(ip)
+    deep_open_ports = mod_port_scan_auto(ip)
+    tls_host = domain if domain and domain != ip else ip
+    for p, _b in deep_open_ports:
+        if p in (443, 8443, 993, 995):
+            try:
+                mod_tls(tls_host, p, probe_versions=False)
+            except Exception as e:
+                console.print(f"  [{C['warn']}]TLS probe on :{p} failed: {e}[/]")
     if domain and domain != ip:
         spinner_task("DNS Records",       mod_dns,         domain); time.sleep(0.1)
-        spinner_task("Subdomain enum",    mod_subdomains,  domain); time.sleep(0.1)
+        mod_subdomains(domain); time.sleep(0.1)
         spinner_task("Host records",      mod_host_records,domain); time.sleep(0.1)
         spinner_task("HTTP headers",      mod_http_headers,domain); time.sleep(0.1)
         spinner_task("WHOIS",             mod_whois,       domain)
@@ -610,7 +1105,7 @@ def subdomain_hunt(domain: str):
     os.system("clear" if os.name != "nt" else "cls")
     console.print(Align.center(MINI_BANNER))
     console.print()
-    spinner_task("Fetching certificate logs", mod_subdomains, domain)
+    mod_subdomains(domain)
     spinner_task("Fetching host records",     mod_host_records, domain)
     spinner_task("DNS Records",               mod_dns, domain)
     _pause()
@@ -779,9 +1274,12 @@ def advanced_search():
                     if match: count += 1
                 if count > 0:
                     console.print(f"  [{C['info']}]Suggestion: Found {count} results by dropping '{pf}' filter.[/]")
+    _cvss_cache = _cache_load()
     def _is_high(c):
-        try: return int(c.split("-")[-1]) % 10 >= 6
-        except: return False
+        entry = _cvss_cache.get(c)
+        if not entry:
+            return False
+        return str(entry.get("severity", "")).lower() in ("high", "critical")
     results.sort(key=lambda x: (-len(x.get("vulns", [])), -sum(1 for c in x.get("vulns", []) if _is_high(c)), -sum(1 for p in x.get("ports", []) if p in (3306, 27017, 6379, 5432)), str(x.get("country") or "")))
     console.print()
     console.rule(f"[bold {C['accent']}]>> ADVANCED SEARCH RESULTS[/]", style=C['muted'])
@@ -805,13 +1303,14 @@ def advanced_search():
         console.print(f"  [{C['accent']}]Saved → {fname}[/]")
     _pause()
 MENU_ITEMS = [
-    ("1", "DEEP SCAN",          "Full recon on one target  (IP + domain)"),
+    ("1", "DEEP SCAN",          "Full recon on one target  (IP + domain + TLS)"),
     ("2", "MASS SCAN",          "Bulk scan — CVEs, ports, geo for many targets"),
     ("3", "QUICK LOOKUP",       "Fast IP geo + Shodan + network info"),
-    ("4", "SUBDOMAIN HUNTER",   "crt.sh cert logs + host records + DNS"),
-    ("5", "PORT SCANNER",       "Multi-threaded socket port scan + banner grab"),
-    ("6", "CVE CHECK",          "Shodan InternetDB CVE list for an IP"),
+    ("4", "SUBDOMAIN HUNTER",   "crt.sh + wordlist brute-force + wildcard detect"),
+    ("5", "PORT SCANNER",       "nmap (-sV) if available, else multi-threaded socket"),
+    ("6", "CVE CHECK",          "Shodan InternetDB CVEs with real CVSS from NVD"),
     ("7", "ADVANCED SEARCH",    "Full query syntax workflow (http, ssl, ports, geo)"),
+    ("8", "TLS / CERT ANALYSIS","Cert details + supported TLS versions + cipher"),
     ("0", "EXIT",               ""),
 ]
 def print_menu():
@@ -839,7 +1338,7 @@ def main():
             print_menu()
             choice = Prompt.ask(
                 f"  [{C['accent']}]GHOST[/][{C['muted']}](Ctrl+C to menu)>[/]",
-                choices=["0","1","2","3","4","5","6","7"],
+                choices=[n for n, *_ in MENU_ITEMS],
                 show_choices=False,
             ).strip()
             if choice == "1":
@@ -870,7 +1369,13 @@ def main():
                     if ip:
                         os.system("clear" if os.name != "nt" else "cls")
                         console.print(Align.center(MINI_BANNER)); console.print()
-                        mod_port_scan(ip, grab_banner=True)
+                        backend = "nmap" if _nmap_path() else "socket"
+                        console.print(f"  [dim]Backend: {backend} | install nmap for -sV/version detection[/]")
+                        spec = Prompt.ask(
+                            f"  [{C['accent']}]>>[/] Port spec (Enter=common, e.g. 22,80,443  1-1000  top100)",
+                            default=""
+                        ).strip()
+                        mod_port_scan_auto(ip, port_spec=spec or None)
                         _pause()
                     else:
                         console.print(f"  [{C['danger']}]Cannot resolve {t}[/]")
@@ -886,6 +1391,26 @@ def main():
                         _pause()
             elif choice == "7":
                 advanced_search()
+            elif choice == "8":
+                host = _input_target("Enter host (e.g. example.com)")
+                if host:
+                    port_str = Prompt.ask(
+                        f"  [{C['accent']}]>>[/] Port",
+                        default="443"
+                    ).strip() or "443"
+                    try:
+                        port = int(port_str)
+                    except ValueError:
+                        console.print(f"  [{C['danger']}]Invalid port: {port_str}[/]")
+                        time.sleep(1)
+                        continue
+                    os.system("clear" if os.name != "nt" else "cls")
+                    console.print(Align.center(MINI_BANNER)); console.print()
+                    try:
+                        mod_tls(host, port, probe_versions=True)
+                    except Exception as e:
+                        console.print(f"  [{C['danger']}]TLS analysis failed: {e}[/]")
+                    _pause()
             elif choice == "0":
                 console.print(f"\n  [{C['accent']}]Stay ghostly.[/]\n")
                 sys.exit(0)
