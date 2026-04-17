@@ -142,15 +142,72 @@ def print_kv(key: str, val, style_val: str = C['white']):
                 console.print(f"  {'':22} [{style_val}]{v}[/]")
     else:
         console.print(f"  {k} [{style_val}]{val if val else '-'}[/]")
-def safe_get(url: str, params: dict = None, json_resp: bool = True, timeout: int = TIMEOUT):
+_RATE_LOCKS = {}
+_LAST_CALL = {}
+_HOST_MIN_INTERVAL = {
+    "api.hackertarget.com": 1.5,
+    "internetdb.shodan.io": 0.4,
+    "crt.sh": 1.0,
+    "urlscan.io": 1.0,
+    "api.bgpview.io": 0.6,
+    "ip-api.com": 0.3,
+    "ipwho.is": 0.3,
+    "dns.google": 0.1,
+}
+def _host_of(url: str) -> str:
     try:
-        r = SESSION.get(url, params=params, timeout=timeout)
-        r.raise_for_status()
-        return r.json() if json_resp else r.text
-    except requests.exceptions.HTTPError as e:
-        return {"_http_error": str(e), "_status": r.status_code if 'r' in dir() else 0}
-    except Exception as e:
-        return {"_error": str(e)}
+        from urllib.parse import urlparse
+        return urlparse(url).hostname or ""
+    except Exception:
+        return ""
+def _throttle(host: str):
+    interval = _HOST_MIN_INTERVAL.get(host, 0.0)
+    if interval <= 0:
+        return
+    lock = _RATE_LOCKS.setdefault(host, threading.Lock())
+    with lock:
+        last = _LAST_CALL.get(host, 0.0)
+        delta = time.time() - last
+        if delta < interval:
+            time.sleep(interval - delta)
+        _LAST_CALL[host] = time.time()
+def safe_get(url: str, params: dict = None, json_resp: bool = True, timeout: int = TIMEOUT, max_retries: int = 4):
+    host = _host_of(url)
+    backoff = 1.0
+    last_status = 0
+    last_err = ""
+    for attempt in range(max_retries):
+        _throttle(host)
+        r = None
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            status = r.status_code
+            if status == 429 or 500 <= status < 600:
+                last_status = status
+                retry_after = r.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else backoff
+                wait = min(wait, 15.0)
+                time.sleep(wait)
+                backoff = min(backoff * 2, 15.0)
+                continue
+            r.raise_for_status()
+            return r.json() if json_resp else r.text
+        except requests.exceptions.HTTPError as e:
+            last_status = r.status_code if r is not None else 0
+            last_err = str(e)
+            if last_status in (400, 401, 403, 404, 410):
+                return {"_http_error": last_err, "_status": last_status}
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 15.0)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_err = str(e)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 15.0)
+        except Exception as e:
+            return {"_error": str(e)}
+    if last_status:
+        return {"_http_error": last_err or f"HTTP {last_status}", "_status": last_status}
+    return {"_error": last_err or "max retries exceeded"}
 def resolve(target: str):
     if is_ip(target):
         return target, None
