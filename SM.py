@@ -1165,7 +1165,7 @@ def advanced_search():
         console.print(f"  [{C['warn']}]Invalid syntax. Ensure you use colons (e.g., http.title:\"Dashboard\")[/]")
         _pause()
         return
-    valid_keys = {"http.title", "http.server", "http.status", "http.body", "http.favicon.hash", "tech", "ssl", "ssl.cert.issuer.org", "ssl.cert.subject.cn", "ssl.cert.expired", "hostname", "domain", "subdomain", "ip", "port", "country", "org", "asn", "isp"}
+    valid_keys = {"http.title", "http.server", "http.status", "http.body", "http.favicon.hash", "tech", "ssl", "ssl.cert.issuer.cn", "ssl.cert.issuer.org", "ssl.cert.subject.cn", "ssl.cert.expired", "hostname", "domain", "subdomain", "ip", "port", "country", "org", "asn", "isp"}
     unknown = [k for k in filters if k not in valid_keys]
     if unknown:
         console.print(f"  [{C['warn']}]Unknown filter(s): {', '.join(unknown)}. Check syntax (use '.' like http.title)[/]")
@@ -1176,8 +1176,9 @@ def advanced_search():
         console.print(f"  [{C['warn']}]Primary filter required (e.g., http.title, ip, domain). 'port' and 'country' are post-filters only.[/]")
         _pause()
         return
-    urlscan_map = {"http.title": "page.title", "http.server": "page.server", "tech": "page.server", "http.status": "page.statusCode", "http.body": "text", "http.favicon.hash": "hash"}
+    urlscan_map = {"http.title": "page.title", "http.server": "page.server", "tech": "page.server", "http.status": "page.statusCode", "http.body": "page.text", "http.favicon.hash": "hash"}
     ips = set()
+    diag = []
     with Progress(SpinnerColumn(spinner_name="dots2", style=f"bold {C['accent']}"),TextColumn(f"[{C['info']}]Searching...[/]"),console=console,transient=True) as prog:
         task = prog.add_task("Search", total=None)
         if any(k in urlscan_map for k in filters):
@@ -1186,20 +1187,29 @@ def advanced_search():
                 if k in urlscan_map:
                     for v in filters[k]:
                         q_parts.append(f'{urlscan_map[k]}:"{v}"')
+            q_str = " AND ".join(q_parts)
             try:
-                data = safe_get("https://urlscan.io/api/v1/search/", params={"q": " AND ".join(q_parts)})
+                data = safe_get("https://urlscan.io/api/v1/search/", params={"q": q_str})
                 if isinstance(data, dict) and "_error" not in data:
+                    before = len(ips)
                     for r in data.get("results", []):
                         val = r.get("page", {}).get("ip")
                         if val: ips.add(val)
-            except Exception: pass
-        crtsh_keys = {"ssl", "hostname", "domain", "subdomain", "ssl.cert.issuer.cn", "ssl.cert.subject.cn"}
+                    diag.append(f"urlscan ({q_str}) → {len(ips)-before} IPs from {len(data.get('results', []))} hits")
+                else:
+                    err = data.get("_error", "unknown") if isinstance(data, dict) else str(type(data).__name__)
+                    diag.append(f"urlscan ({q_str}) → ERROR: {err}")
+            except Exception as e:
+                diag.append(f"urlscan ({q_str}) → EXCEPTION: {e}")
+        crtsh_keys = {"ssl", "hostname", "domain", "subdomain", "ssl.cert.issuer.cn", "ssl.cert.issuer.org", "ssl.cert.subject.cn"}
         for k in crtsh_keys:
             if k in filters:
                 for v in filters[k]:
                     try:
                         data = safe_get("https://crt.sh/", params={"q": f"%{v.replace('*', '%')}%", "output": "json"})
                         if isinstance(data, list):
+                            before = len(ips)
+                            seen_hosts = 0
                             for entry in data:
                                 if "not_after" in entry:
                                     try:
@@ -1207,9 +1217,15 @@ def advanced_search():
                                             continue
                                     except: pass
                                 for n in entry.get("name_value","").splitlines():
+                                    seen_hosts += 1
                                     ip, _ = resolve(n.strip().lstrip("*."))
                                     if ip: ips.add(ip)
-                    except Exception: pass
+                            diag.append(f"crt.sh ({k}:{v}) → {len(ips)-before} IPs resolved from {seen_hosts} names")
+                        else:
+                            err = data.get("_error", "unknown") if isinstance(data, dict) else str(type(data).__name__)
+                            diag.append(f"crt.sh ({k}:{v}) → ERROR: {err}")
+                    except Exception as e:
+                        diag.append(f"crt.sh ({k}:{v}) → EXCEPTION: {e}")
         if "ip" in filters:
             for ip_val in filters["ip"]:
                 try:
@@ -1219,6 +1235,10 @@ def advanced_search():
     ips = list(ips)[:100]
     if not ips:
         console.print(f"  [{C['warn']}]No IPs gathered.[/]")
+        for line in diag:
+            console.print(f"  [{C['muted']}]• {line}[/]")
+        if not diag:
+            console.print(f"  [{C['muted']}]• No source was queried — primary filters matched no known backend.[/]")
         _pause()
         return
     results = []
