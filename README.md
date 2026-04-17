@@ -32,6 +32,29 @@ Extras:
 - Graceful handling of `Ctrl+C` to return to the menu instead of crashing.
 - Severity-tagged CVE output with clickable NVD links (`https://nvd.nist.gov/vuln/detail/<CVE-ID>`).
 - Optional JSON export from Advanced Search (`ghost_adv_YYYYMMDD_HHMMSS.json`).
+- Per-host rate limiting and automatic retries with exponential backoff on every API call (see below).
+
+---
+
+## Rate limiting & retries
+
+All outbound HTTP requests go through a single `safe_get()` helper that enforces:
+
+- **Per-host throttling** — a minimum interval between consecutive requests to the same host, so parallel mass-scans don't burst the same API. Current intervals:
+  - `api.hackertarget.com` — 1.5 s
+  - `crt.sh` — 1.0 s
+  - `urlscan.io` — 1.0 s
+  - `api.bgpview.io` — 0.6 s
+  - `internetdb.shodan.io` — 0.4 s
+  - `ip-api.com`, `ipwho.is` — 0.3 s
+  - `dns.google` — 0.1 s
+- **Retry with exponential backoff** — up to 4 attempts, backoff doubling from 1 s up to a 15 s cap.
+- **`429 Too Many Requests` handling** — respects the server's `Retry-After` header when present, otherwise falls back to the backoff schedule.
+- **`5xx` server errors** — retried with backoff.
+- **`4xx` client errors** (400/401/403/404/410) — returned immediately without retry.
+- **Connection errors / timeouts** — retried with backoff.
+
+This mainly matters for HackerTarget (famously strict free-tier rate limits) and for MASS SCAN workloads, but it applies to every source.
 
 ---
 
