@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import pyfiglet; print\\(pyfiglet.figlet_format\\('ShowMe', font='graffiti'\\)\\)\")",
+      "Bash(pip install:*)",
+      "Bash(figlet -f graffiti \"ShowMe\")"
+    ]
+  }
+}
