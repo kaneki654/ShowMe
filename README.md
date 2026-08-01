@@ -9,9 +9,10 @@
         \/      \/                     \/     \/
 ```
 
-A terminal-based OSINT / reconnaissance framework written in Python. It queries multiple public APIs for information on an IP or domain, scans ports (via Nmap when available), brute-forces subdomains, inspects TLS certificates, and checks known CVEs against real CVSS scores from NVD — all from a single interactive menu.
+A single-file, **keyless**, cross-platform terminal OSINT / reconnaissance console written in Python. It aggregates passive DNS from **6 sources**, brute-forces subdomains, probes live HTTP services with tech fingerprinting (httpx-lite), computes Shodan favicon hashes, scans ports (via Nmap when available), inspects TLS certificates, expands ASNs into netblocks, harvests archived URLs, runs exposure/misconfig checks (nuclei-lite), and enriches known CVEs with **real CVSS scores from NVD** — then exports the whole run to **JSON + HTML + Markdown**. All from one interactive menu, with nothing to compile and no API keys required.
 
 **Author:** G0Ju.VBS
+&nbsp;·&nbsp; See [COMPARISON.md](COMPARISON.md) for an honest benchmark against Amass, subfinder, theHarvester, SpiderFoot, httpx, nuclei, and Shodan.
 
 ---
 
@@ -19,10 +20,10 @@ A terminal-based OSINT / reconnaissance framework written in Python. It queries 
 
 All features are exposed through the interactive menu in `SM.py`:
 
-1. **DEEP SCAN** — Full recon on one target. Resolves the target, pulls geo / ISP / ASN data, Shodan InternetDB info (open ports, hostnames, CVEs with real CVSS scores), BGP view records, reverse-DNS, WHOIS, DNS records, port scan with banner grabbing, subdomain enumeration (passive + brute-force), and **auto-runs TLS analysis on any open TLS port** (443, 8443, 993, 995).
+1. **DEEP SCAN** — Full recon on one target. Resolves the target, pulls geo / ISP / ASN data, Shodan InternetDB info (open ports, hostnames, CVEs with real CVSS scores), RIPEstat network/ASN records, reverse-DNS, WHOIS, DNS records, port scan with banner grabbing, subdomain enumeration (passive + brute-force), **auto-runs TLS analysis on any open TLS port** (443, 8443, 993, 995), and finishes with **HTTP tech fingerprinting, a favicon hash, and an exposure/misconfig sweep**.
 2. **MASS SCAN** — Bulk mode. Feeds a list of IPs or domains (entered manually or loaded from a file) and collects geo, ISP, open ports, and CVE counts for each target in parallel. *Note: mass scan intentionally does not fetch full CVSS details to stay within NVD rate limits.*
 3. **QUICK LOOKUP** — Fast lightweight recon: geo / ASN / ISP + Shodan InternetDB summary.
-4. **SUBDOMAIN HUNTER** — Passive enumeration via `crt.sh` certificate transparency **plus** wordlist brute-force (~1100 common names bundled) **plus** hackertarget host records and Google DNS record lookups. Includes wildcard-DNS detection to avoid false positives.
+4. **SUBDOMAIN HUNTER** — Multi-source passive enumeration across **6 keyless sources** run in parallel (`crt.sh`, AlienVault **OTX**, **Anubis**/jldc, **CertSpotter**, **RapidDNS**, **HackerTarget**), merged into one source-tagged tree, **plus** wordlist brute-force (~1100 common names bundled) and Google DNS lookups. Includes wildcard-DNS detection to avoid false positives. Aggregation is resilient — if one source is down or rate-limiting, the others still deliver.
 5. **PORT SCANNER** — Auto-detects `nmap` and uses it with `-sV -Pn -T3 --open` for service/version detection, falling back to a multi-threaded Python socket scanner with per-protocol banner probes (HTTP, FTP, SSH, SMTP, MySQL, Redis, etc.) when Nmap is not installed. Accepts custom port specs: `22,80,443`, `1-1000`, `top100`, or blank for the default common-port list.
 6. **CVE CHECK** — Pulls the CVE list from Shodan InternetDB and enriches each CVE with **real CVSS v3.1/v3.0/v2 scores and severity** fetched from the NVD API (with disk cache + rate-limit respect).
 7. **ADVANCED SEARCH** — Interactive query builder using filter syntax (e.g. `http.title:"Dashboard" port:8080 country:US`, `ssl.cert.subject.cn:*.example.com`, `hostname:*.gov`). Queries urlscan.io and crt.sh. Results can be exported to JSON.
@@ -32,6 +33,12 @@ All features are exposed through the interactive menu in `SM.py`:
    - `Not Before` / `Not After` + computed days-until-expiry (color-coded: danger when expired, warn when <30 days).
    - Negotiated TLS version + cipher suite (weak ciphers flagged: `RC4`, `3DES`, `MD5`, `EXPORT`, `NULL`).
    - Support matrix for TLSv1 / TLSv1.1 / TLSv1.2 / TLSv1.3 — each probed with a dedicated handshake, classified as `[SUPPORTED]` (deprecated versions colored red per RFC 8996), `[NOT OFFERED]`, or `[DISABLED IN CLIENT]`.
+9. **HTTP PROBE** (httpx-lite) — Concurrent HTTP/HTTPS probing of one host, a comma-separated list, or an entire domain's discovered subdomains. Reports status (color-coded), final URL, `Server`, content length, page title, and a **tech fingerprint** (nginx/Apache/IIS, WordPress/Drupal/Joomla/Magento, Laravel/Django/Express/ASP.NET, React/Angular/Vue/Next.js, Cloudflare, jQuery/Bootstrap, …) derived from headers, cookies, and body signatures.
+10. **WAYBACK URLS** — Harvests archived URLs for a domain from the Wayback Machine (archive.org CDX), then extracts and summarizes discovered **URL parameters** and **notable file types** (`.js`, `.json`, `.env`, `.bak`, `.sql`, `.config`, …). Exportable to a text file.
+11. **ASN / NETBLOCKS** — Expands an **ASN** (e.g. `AS15169`) or an **org name** (e.g. `cloudflare`) into every announced IPv4/IPv6 prefix, with per-prefix host counts and a total address tally. Backed by **RIPEstat** (reliable, keyless) with a BGPView fallback.
+12. **EXPOSURE SCAN** (nuclei-lite) — Active misconfiguration triage: **security-header hygiene score** (HSTS, CSP, X-Frame-Options, …), server/`X-Powered-By` banner-leak flags, and ~12 high-signal sensitive-path checks (`.git/config`, `.env`, `.aws/credentials`, Spring `actuator`, `phpinfo`, `server-status`, backups, `.DS_Store`, …).
+13. **FAVICON HASH** — Fetches the target's favicon and computes its **Shodan-compatible MurmurHash3** (pure-Python, verified against reference `mmh3`), printing a ready-to-use `http.favicon.hash:` dork to pivot to every internet host serving the same icon.
+14. **FULL REPORT** — Runs the whole toolkit against one target and writes a self-contained, theme-styled **HTML** report plus machine-readable **JSON** and **Markdown** (`ghost_report_<target>_<timestamp>.{json,html,md}`).
 
 Extras:
 - Animated ASCII banner, colored output, and a "glitch" text effect using `rich`.
@@ -146,10 +153,16 @@ No API keys are required for the core feature set — every service used has a f
 | Shodan InternetDB | `https://internetdb.shodan.io/<ip>` | Open ports, hostnames, vulnerabilities (CVE IDs), tags |
 | NVD API | `https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=<CVE>` | Real CVSS v3.1/v3.0/v2 scores & severity (+ optional API key) |
 | ipwho.is | `https://ipwho.is/<ip>` | Extended geo / connection info |
-| BGPView | `https://api.bgpview.io/ip/<ip>` | ASN / prefix / RIR info |
+| RIPEstat | `https://stat.ripe.net/data/{network-info,as-overview,announced-prefixes,searchcomplete}` | IP→ASN, AS holder, netblock expansion, org→ASN search |
+| BGPView | `https://api.bgpview.io/ip/<ip>` | ASN / prefix info (fallback when RIPEstat is unavailable) |
 | Google DNS-over-HTTPS | `https://dns.google/resolve` | A, AAAA, MX, NS, TXT, CNAME records |
 | crt.sh | `https://crt.sh/?q=%.<domain>&output=json` | Certificate transparency / subdomain enumeration |
-| HackerTarget | `https://api.hackertarget.com/reverseiplookup/`, `/hostsearch/`, `/whois/` | Reverse IP, host records, WHOIS |
+| AlienVault OTX | `https://otx.alienvault.com/api/v1/indicators/domain/<domain>/passive_dns` | Passive-DNS subdomains |
+| Anubis (jldc) | `https://jldc.me/anubis/subdomains/<domain>` | Passive subdomains |
+| CertSpotter | `https://api.certspotter.com/v1/issuances?domain=<domain>&include_subdomains=true` | Certificate-transparency subdomains |
+| RapidDNS | `https://rapiddns.io/subdomain/<domain>?full=1` | Passive subdomains |
+| HackerTarget | `https://api.hackertarget.com/{reverseiplookup,hostsearch,whois}/` | Reverse IP, host records, WHOIS, subdomains |
+| Wayback Machine | `http://web.archive.org/cdx/search/cdx` | Archived URL harvesting (parameters, file types) |
 | urlscan.io | `https://urlscan.io/api/v1/search/` | Advanced query search over scanned URLs |
 
 Port scanning (Nmap + socket fallback) and TLS analysis run directly against the target — no third-party API.

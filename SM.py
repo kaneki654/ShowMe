@@ -15,6 +15,16 @@ import re
 import ipaddress
 from ipaddress import ip_address
 __author__ = "G0Ju.VBS"
+# On Windows the console's default code page (e.g. cp1252) can't encode the
+# box-drawing / bullet / arrow characters used throughout the UI, which makes
+# rich abort with UnicodeEncodeError before the menu even appears. Force UTF-8
+# on the output streams before the Console is built so the banner and tables
+# render instead of crashing at startup.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError, OSError):
+        pass
 MISSING = []
 try:
     import requests
@@ -408,19 +418,40 @@ def mod_ipwho(ip: str):
     print_kv("Continent",  data.get("continent"))
     print_kv("EU Member",  str(data.get("is_eu", False)))
 def mod_bgpview(ip: str):
-    section_header("BGPVIEW", ">")
-    data = safe_get(f"https://api.bgpview.io/ip/{ip}")
-    if isinstance(data, dict) and data.get("status") == "ok":
-        prefixes = data.get("data", {}).get("prefixes", [{}])
+    section_header("NETWORK / ASN  (RIPEstat)", ">")
+    # RIPEstat first (reliable, keyless); fall back to BGPView if unreachable.
+    data = safe_get("https://stat.ripe.net/data/network-info/data.json",
+                    params={"resource": ip}, timeout=10, max_retries=2)
+    prefix, asn = None, None
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        d = data["data"]
+        prefix = d.get("prefix")
+        asns = d.get("asns") or []
+        asn = asns[0] if asns else None
+    if prefix or asn:
+        if prefix:
+            print_kv("Prefix", prefix, C['white'])
+        if asn:
+            print_kv("ASN", f"AS{asn}", C['purple'])
+            ov = safe_get("https://stat.ripe.net/data/as-overview/data.json",
+                          params={"resource": f"AS{asn}"}, timeout=10, max_retries=2)
+            if isinstance(ov, dict) and isinstance(ov.get("data"), dict):
+                holder = ov["data"].get("holder")
+                if holder:
+                    print_kv("AS Holder", holder, C['cyan'])
+        return
+    bg = safe_get(f"https://api.bgpview.io/ip/{ip}")
+    if isinstance(bg, dict) and bg.get("status") == "ok":
+        prefixes = bg.get("data", {}).get("prefixes", [{}])
         if prefixes:
             first = prefixes[0]
-            asn = first.get("asn", {})
+            a = first.get("asn", {})
             print_kv("Prefix", first.get("prefix"))
-            print_kv("ASN", asn.get("asn"), C['purple'])
-            print_kv("Name", asn.get("name"), C['cyan'])
-            print_kv("Description", asn.get("description"), C['muted'])
-    else:
-        console.print("  [dim]No BGPView data[/]")
+            print_kv("ASN", a.get("asn"), C['purple'])
+            print_kv("Name", a.get("name"), C['cyan'])
+            print_kv("Description", a.get("description"), C['muted'])
+            return
+    console.print("  [dim]No network / ASN data[/]")
 def mod_dns(domain: str):
     section_header("DNS RECORDS  (Google DoH)", ">")
     types = ["A","AAAA","NS","MX","TXT","CNAME","SOA"]
@@ -513,24 +544,31 @@ def mod_subdomains(domain, bruteforce=True, wordlist_path=None):
         bruteforce = False
     else:
         console.print(f"  [dim]No wildcard.[/]")
-    console.print(f"  [dim]Querying crt.sh (passive)...[/]")
-    passive = mod_subdomains_passive(domain)
+    console.print(f"  [dim]Querying {len(PASSIVE_SOURCES)} passive sources "
+                  f"(crt.sh, OTX, Anubis, CertSpotter, Wayback, RapidDNS, HackerTarget)...[/]")
+    passive_map, counts = spinner_task("Aggregating passive DNS sources", gather_passive_subdomains, domain)
+    passive_set = set(passive_map)
     brute = []
     if bruteforce:
         brute = mod_subdomains_bruteforce(domain, wordlist_path=wordlist_path)
-    passive_set = set(passive)
     brute_set = {h for h, _ip in brute}
+    for h in brute_set:
+        passive_map.setdefault(h, set()).add("brute")
     all_names = sorted(passive_set | brute_set)
     tree = Tree(f"[bold {C['accent']}]{domain}[/]")
-    for name in all_names:
-        tags = []
-        if name in passive_set: tags.append(f"[dim cyan][crt.sh][/]")
-        if name in brute_set:   tags.append(f"[dim green][brute][/]")
-        tree.add(f"[{C['cyan']}]{name}[/]  {' '.join(tags)}")
+    MAXSHOW = 300
+    for name in all_names[:MAXSHOW]:
+        srcs = sorted(passive_map.get(name, set()))
+        tag = " ".join(f"[dim cyan]{s}[/]" for s in srcs)
+        tree.add(f"[{C['cyan']}]{mesc(name)}[/]  {tag}")
+    if len(all_names) > MAXSHOW:
+        tree.add(f"[dim]... and {len(all_names) - MAXSHOW} more (in export/report)[/]")
     console.print(Padding(tree, (0, 4)))
+    breakdown = ", ".join(f"{k}={v}" for k, v in sorted(counts.items(), key=lambda x: -x[1]))
+    console.print(f"\n  [dim]Sources: {breakdown}[/]")
     console.print(
-        f"\n  [dim]Total: {len(all_names)} unique "
-        f"(crt.sh={len(passive_set)}, brute={len(brute_set)}, "
+        f"  [dim]Total: {len(all_names)} unique "
+        f"(passive={len(passive_set)}, brute={len(brute_set)}, "
         f"overlap={len(passive_set & brute_set)})[/]"
     )
     return all_names
@@ -1084,6 +1122,16 @@ def deep_scan(target: str):
         spinner_task("WHOIS",             mod_whois,       domain)
     elif domain is None:
         spinner_task("Reverse DNS",       mod_http_headers, ip)
+    mod_http_probe([tls_host]); time.sleep(0.1)
+    try:
+        mod_favicon(tls_host)
+    except Exception as e:
+        console.print(f"  [{C['warn']}]Favicon probe failed: {e}[/]")
+    time.sleep(0.1)
+    try:
+        mod_exposures(tls_host)
+    except Exception as e:
+        console.print(f"  [{C['warn']}]Exposure scan failed: {e}[/]")
     section_header("SCAN COMPLETE", "*")
     console.print(f"  [{C['accent']}]Finished: {datetime.utcnow().strftime('%H:%M:%S UTC')}[/]")
     _pause()
@@ -1322,16 +1370,738 @@ def advanced_search():
         with open(fname,"w") as f: json.dump(results, f, indent=2)
         console.print(f"  [{C['accent']}]Saved → {fname}[/]")
     _pause()
+# ============================================================================
+#  POWER MODULES (v3.0)
+#  Multi-source passive DNS · httpx-lite probing · tech fingerprinting ·
+#  favicon pivoting · wayback harvesting · ASN expansion · exposure checks ·
+#  full report export.  Keyless, cross-platform, stdlib + requests + rich.
+# ============================================================================
+import base64
+from urllib.parse import urlparse, urljoin
+from rich.markup import escape as mesc
+
+_HOST_MIN_INTERVAL.update({
+    "otx.alienvault.com":  0.5,
+    "jldc.me":             1.0,
+    "api.certspotter.com": 2.0,
+    "web.archive.org":     1.0,
+    "rapiddns.io":         1.5,
+    "stat.ripe.net":       0.2,
+})
+
+# ---------------------------------------------------------------------------
+#  MurmurHash3 (x86_32) — pure Python, matches mmh3.hash() used by Shodan
+# ---------------------------------------------------------------------------
+def _mmh3_32(data, seed=0):
+    c1, c2 = 0xcc9e2d51, 0x1b873593
+    length = len(data)
+    h1 = seed & 0xffffffff
+    rounded_end = length & 0xfffffffc
+    for i in range(0, rounded_end, 4):
+        k1 = (data[i] & 0xff) | ((data[i + 1] & 0xff) << 8) | \
+             ((data[i + 2] & 0xff) << 16) | ((data[i + 3] & 0xff) << 24)
+        k1 = (k1 * c1) & 0xffffffff
+        k1 = ((k1 << 15) | (k1 >> 17)) & 0xffffffff
+        k1 = (k1 * c2) & 0xffffffff
+        h1 ^= k1
+        h1 = ((h1 << 13) | (h1 >> 19)) & 0xffffffff
+        h1 = (h1 * 5 + 0xe6546b64) & 0xffffffff
+    k1 = 0
+    tail = length & 0x03
+    if tail == 3:
+        k1 = (data[rounded_end + 2] & 0xff) << 16
+    if tail >= 2:
+        k1 |= (data[rounded_end + 1] & 0xff) << 8
+    if tail >= 1:
+        k1 |= (data[rounded_end] & 0xff)
+        k1 = (k1 * c1) & 0xffffffff
+        k1 = ((k1 << 15) | (k1 >> 17)) & 0xffffffff
+        k1 = (k1 * c2) & 0xffffffff
+        h1 ^= k1
+    h1 ^= length
+    h1 ^= (h1 >> 16)
+    h1 = (h1 * 0x85ebca6b) & 0xffffffff
+    h1 ^= (h1 >> 13)
+    h1 = (h1 * 0xc2b2ae35) & 0xffffffff
+    h1 ^= (h1 >> 16)
+    if h1 & 0x80000000:
+        h1 = -((h1 ^ 0xffffffff) + 1)
+    return h1
+
+def favicon_hash(fav_bytes):
+    try:
+        return _mmh3_32(base64.encodebytes(fav_bytes))
+    except Exception:
+        return None
+
+def _raw_get(url, timeout=TIMEOUT, allow_redirects=True):
+    host = _host_of(url)
+    _throttle(host)
+    try:
+        return SESSION.get(url, timeout=timeout, allow_redirects=allow_redirects)
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+#  Passive subdomain sources  (all keyless)
+# ---------------------------------------------------------------------------
+def _src_crtsh(domain):
+    out = set()
+    data = safe_get("https://crt.sh/", params={"q": f"%.{domain}", "output": "json"}, timeout=20, max_retries=2)
+    if isinstance(data, list):
+        for e in data:
+            for n in str(e.get("name_value", "")).splitlines():
+                n = n.strip().lstrip("*.").lower()
+                if n.endswith("." + domain) and "@" not in n:
+                    out.add(n)
+    return out
+
+def _src_otx(domain):
+    out = set()
+    data = safe_get(f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns", timeout=12, max_retries=2)
+    if isinstance(data, dict):
+        for rec in data.get("passive_dns", []) or []:
+            n = str(rec.get("hostname", "")).strip().lower().rstrip(".")
+            if n.endswith("." + domain):
+                out.add(n)
+    return out
+
+def _src_anubis(domain):
+    out = set()
+    data = safe_get(f"https://jldc.me/anubis/subdomains/{domain}")
+    if isinstance(data, list):
+        for n in data:
+            n = str(n).strip().lower()
+            if n.endswith("." + domain):
+                out.add(n)
+    return out
+
+def _src_certspotter(domain):
+    out = set()
+    data = safe_get("https://api.certspotter.com/v1/issuances",
+                    params={"domain": domain, "include_subdomains": "true", "expand": "dns_names"}, timeout=15, max_retries=2)
+    if isinstance(data, list):
+        for e in data:
+            for n in e.get("dns_names", []) or []:
+                n = str(n).strip().lstrip("*.").lower()
+                if n.endswith("." + domain):
+                    out.add(n)
+    return out
+
+def _src_wayback(domain):
+    out = set()
+    data = safe_get("http://web.archive.org/cdx/search/cdx",
+                    params={"url": f"*.{domain}/*", "output": "json",
+                            "fields": "original", "collapse": "urlkey", "limit": "15000"}, timeout=25)
+    if isinstance(data, list) and data:
+        for row in data[1:]:
+            u = row[0] if isinstance(row, list) and row else None
+            if not u:
+                continue
+            try:
+                h = (urlparse(u).hostname or "").lower()
+            except Exception:
+                h = ""
+            if h.endswith("." + domain):
+                out.add(h)
+    return out
+
+def _src_rapiddns(domain):
+    out = set()
+    text = safe_get(f"https://rapiddns.io/subdomain/{domain}", params={"full": "1"}, json_resp=False, timeout=15, max_retries=2)
+    if isinstance(text, str):
+        for m in re.finditer(r"([a-zA-Z0-9_][a-zA-Z0-9_.-]*\." + re.escape(domain) + r")", text):
+            out.add(m.group(1).strip().lower())
+    return out
+
+def _src_hackertarget(domain):
+    out = set()
+    text = safe_get(f"https://api.hackertarget.com/hostsearch/?q={domain}", json_resp=False)
+    if isinstance(text, str) and "," in text and "error" not in text.lower():
+        for line in text.splitlines():
+            n = line.split(",")[0].strip().lower()
+            if n.endswith("." + domain):
+                out.add(n)
+    return out
+
+# NOTE: wayback (archive.org CDX) is intentionally NOT a passive subdomain
+# source — the *.domain/* CDX query routinely takes 90s+ and often times out,
+# which would gate the whole parallel gather on its slowest member. It lives on
+# as its own dedicated feature (mod_wayback) with a lighter host-scoped query.
+PASSIVE_SOURCES = {
+    "crt.sh":       _src_crtsh,
+    "otx":          _src_otx,
+    "anubis":       _src_anubis,
+    "certspotter":  _src_certspotter,
+    "rapiddns":     _src_rapiddns,
+    "hackertarget": _src_hackertarget,
+}
+
+def gather_passive_subdomains(domain):
+    """Query every passive source in parallel. Returns (host->set(sources), source->count)."""
+    results = {}
+    counts = {}
+    def run(item):
+        name, fn = item
+        try:
+            return name, fn(domain)
+        except Exception:
+            return name, set()
+    items = list(PASSIVE_SOURCES.items())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(items)) as ex:
+        for name, subs in ex.map(run, items):
+            counts[name] = len(subs)
+            for h in subs:
+                results.setdefault(h, set()).add(name)
+    return results, counts
+
+# ---------------------------------------------------------------------------
+#  httpx-lite: live HTTP probing + tech fingerprinting
+# ---------------------------------------------------------------------------
+_TECH_HEADER = [
+    ("server", r"nginx", "nginx"), ("server", r"apache", "Apache"),
+    ("server", r"microsoft-iis", "IIS"), ("server", r"cloudflare", "Cloudflare"),
+    ("server", r"litespeed", "LiteSpeed"), ("server", r"openresty", "OpenResty"),
+    ("server", r"gws", "Google-Web-Server"), ("server", r"cowboy", "Erlang/Cowboy"),
+    ("x-powered-by", r"php", "PHP"), ("x-powered-by", r"asp\.net", "ASP.NET"),
+    ("x-powered-by", r"express", "Express"), ("x-powered-by", r"next\.js", "Next.js"),
+    ("x-aspnet-version", r".", "ASP.NET"), ("x-drupal-cache", r".", "Drupal"),
+    ("x-generator", r"drupal", "Drupal"), ("x-generator", r"wordpress", "WordPress"),
+    ("x-shopify-stage", r".", "Shopify"), ("via", r"varnish", "Varnish"),
+    ("x-served-by", r"cache", "Fastly/Varnish"), ("cf-ray", r".", "Cloudflare"),
+]
+_TECH_COOKIE = [
+    (r"phpsessid", "PHP"), (r"asp\.net_sessionid", "ASP.NET"), (r"jsessionid", "Java"),
+    (r"laravel_session", "Laravel"), (r"ci_session", "CodeIgniter"),
+    (r"wordpress_|wp-settings", "WordPress"), (r"_shopify", "Shopify"),
+    (r"django", "Django"), (r"connect\.sid", "Express"),
+]
+_TECH_BODY = [
+    (r"wp-content|wp-includes", "WordPress"), (r"/sites/(all|default)/|Drupal\.settings", "Drupal"),
+    (r'content="Joomla', "Joomla"), (r"__NEXT_DATA__|/_next/", "Next.js"),
+    (r"ng-version|angular\.js", "Angular"), (r"data-reactroot|react-dom", "React"),
+    (r"csrfmiddlewaretoken|__admin_media_prefix__", "Django"),
+    (r"laravel_session|Laravel", "Laravel"), (r"cdn\.shopify\.com|Shopify\.", "Shopify"),
+    (r"/wp-json/|wp-emoji", "WordPress"), (r"Magento|/static/version\d", "Magento"),
+    (r"vue(\.min)?\.js|__vue__", "Vue.js"), (r"jquery(\.min)?\.js", "jQuery"),
+    (r"bootstrap(\.min)?\.(js|css)", "Bootstrap"), (r"gatsby", "Gatsby"),
+]
+
+def fingerprint_tech(resp):
+    techs = set()
+    headers = {k.lower(): str(v) for k, v in resp.headers.items()}
+    for hname, pat, label in _TECH_HEADER:
+        v = headers.get(hname)
+        if v and re.search(pat, v, re.IGNORECASE):
+            techs.add(label)
+    cookies = headers.get("set-cookie", "")
+    for pat, label in _TECH_COOKIE:
+        if re.search(pat, cookies, re.IGNORECASE):
+            techs.add(label)
+    try:
+        body = resp.text[:250000]
+    except Exception:
+        body = ""
+    for pat, label in _TECH_BODY:
+        if re.search(pat, body, re.IGNORECASE):
+            techs.add(label)
+    return sorted(techs)
+
+def _title_of(body):
+    if not body:
+        return ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", body, re.IGNORECASE | re.DOTALL)
+    return re.sub(r"\s+", " ", m.group(1)).strip()[:120] if m else ""
+
+def http_probe_one(host, timeout=6):
+    host = host.strip()
+    candidates = [host] if host.startswith(("http://", "https://")) else [f"https://{host}", f"http://{host}"]
+    for url in candidates:
+        r = _raw_get(url, timeout=timeout)
+        if r is None:
+            continue
+        try:
+            body = r.text
+        except Exception:
+            body = ""
+        return {
+            "host": host, "url": str(r.url), "status": r.status_code,
+            "server": r.headers.get("Server", "") or "",
+            "title": _title_of(body), "length": len(r.content or b""),
+            "tech": fingerprint_tech(r),
+            "redirected": str(r.url).rstrip("/") != url.rstrip("/"),
+        }
+    return None
+
+def http_probe_many(hosts, workers=25):
+    uniq, seen = [], set()
+    for h in hosts:
+        h = h.strip()
+        if h and h not in seen:
+            seen.add(h); uniq.append(h)
+    results = []
+    if not uniq:
+        return results
+    with Progress(
+        SpinnerColumn(spinner_name="dots2", style=f"bold {C['accent']}"),
+        TextColumn(f"[{C['info']}]Probing {len(uniq)} hosts[/]"),
+        BarColumn(bar_width=30, style=C['muted'], complete_style=C['accent']),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(), console=console, transient=True,
+    ) as prog:
+        task = prog.add_task("", total=len(uniq))
+        def work(h):
+            try:
+                return http_probe_one(h)
+            finally:
+                prog.advance(task)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            try:
+                for res in ex.map(work, uniq):
+                    if res:
+                        results.append(res)
+            except KeyboardInterrupt:
+                console.print(f"\n  [{C['warn']}]Probe interrupted, showing partial results.[/]")
+    results.sort(key=lambda r: (r["status"], r["host"]))
+    return results
+
+def _status_style(code):
+    if 200 <= code < 300: return C['accent']
+    if 300 <= code < 400: return C['info']
+    if 400 <= code < 500: return C['warn']
+    return C['danger']
+
+def _render_probe_table(results):
+    if not results:
+        console.print(f"  [{C['warn']}]No live HTTP services found[/]")
+        return
+    t = Table(box=box.MINIMAL, show_header=True, header_style=f"bold {C['accent']}", padding=(0, 1), expand=True)
+    t.add_column("URL", style=C['cyan'], max_width=40)
+    t.add_column("ST", width=4)
+    t.add_column("SERVER", style=C['purple'], max_width=18)
+    t.add_column("TECH", style=C['white'], max_width=26)
+    t.add_column("TITLE", style=C['muted'], max_width=38)
+    for r in results:
+        t.add_row(
+            mesc(r["url"][:40]),
+            f"[{_status_style(r['status'])}]{r['status']}[/]",
+            mesc((r["server"] or "-")[:18]),
+            mesc(", ".join(r["tech"])[:26] or "-"),
+            mesc((r["title"] or "-")[:38]),
+        )
+    console.print(Padding(t, (0, 2)))
+
+def mod_http_probe(hosts):
+    total = len({h.strip() for h in hosts if h.strip()})
+    section_header(f"HTTP PROBE  (httpx-lite)  ({total} host(s))", ">")
+    results = http_probe_many(hosts)
+    _render_probe_table(results)
+    console.print(f"\n  [dim]Live: {len(results)}/{total}[/]")
+    return results
+
+# ---------------------------------------------------------------------------
+#  Favicon hash (Shodan pivot)
+# ---------------------------------------------------------------------------
+def get_favicon_hash(target):
+    base = target if target.startswith(("http://", "https://")) else "https://" + target
+    fav_url = urljoin(base, "/favicon.ico")
+    r = _raw_get(base)
+    if r is not None:
+        try:
+            m = re.search(r'<link[^>]+rel=["\'][^"\']*icon[^"\']*["\'][^>]*>', r.text, re.IGNORECASE)
+            if m:
+                hm = re.search(r'href=["\']([^"\']+)["\']', m.group(0), re.IGNORECASE)
+                if hm:
+                    fav_url = urljoin(str(r.url), hm.group(1))
+        except Exception:
+            pass
+    fr = _raw_get(fav_url)
+    if fr is None or fr.status_code != 200 or not fr.content:
+        return None, fav_url
+    return favicon_hash(fr.content), fav_url
+
+def mod_favicon(target):
+    section_header("FAVICON HASH  (Shodan pivot)", ">")
+    h, url = get_favicon_hash(target)
+    if h is None:
+        console.print(f"  [dim]No favicon retrievable at {mesc(url)}[/]")
+        return None
+    print_kv("Favicon URL", url, C['cyan'])
+    print_kv("mmh3 hash", str(h), C['gold'])
+    console.print(f"  [dim]Shodan dork:[/] [bold {C['accent']}]http.favicon.hash:{h}[/]")
+    console.print(f"  [dim]Pivots to every internet host serving this same icon (often related infra).[/]")
+    return h
+
+# ---------------------------------------------------------------------------
+#  Wayback URL harvesting  (gau/waybackurls-lite)
+# ---------------------------------------------------------------------------
+def mod_wayback(domain, interactive=True):
+    section_header("WAYBACK URLS  (archive.org CDX)", ">")
+    target = urlparse(domain).hostname if domain.startswith(("http://", "https://")) else domain
+    target = (target or domain).strip()
+    console.print(f"  [dim]Querying archive.org (can be slow)...[/]")
+    data = safe_get("http://web.archive.org/cdx/search/cdx",
+                    params={"url": f"{target}/*", "output": "json",
+                            "fields": "original", "collapse": "urlkey", "limit": "10000"},
+                    timeout=15, max_retries=1)
+    if isinstance(data, dict):
+        console.print("  [dim]archive.org unreachable or timed out (CDX is often slow/blocked).[/]")
+        return []
+    if not isinstance(data, list) or len(data) < 2:
+        console.print("  [dim]No archived URLs found[/]")
+        return []
+    urls, seen = [], set()
+    for row in data[1:]:
+        u = row[0] if isinstance(row, list) and row else None
+        if u and u not in seen:
+            seen.add(u); urls.append(u)
+    params, exts = set(), {}
+    for u in urls:
+        pu = urlparse(u)
+        for kv in pu.query.split("&"):
+            k = kv.split("=")[0].strip()
+            if k:
+                params.add(k)
+        last = pu.path.rsplit("/", 1)[-1]
+        if "." in last:
+            ext = last.rsplit(".", 1)[-1].lower()
+            if ext and len(ext) <= 6 and ext.isalnum():
+                exts[ext] = exts.get(ext, 0) + 1
+    console.print(f"  [{C['accent']}]{len(urls)}[/] unique archived URLs")
+    notable = {k: v for k, v in exts.items()
+               if k in ("js", "json", "php", "asp", "aspx", "jsp", "xml", "env", "bak",
+                        "sql", "zip", "config", "yml", "yaml", "txt", "log", "old", "swp")}
+    if notable:
+        print_kv("Notable file types", [f"{k} ({v})" for k, v in sorted(notable.items(), key=lambda x: -x[1])], C['warn'])
+    if params:
+        plist = sorted(params)
+        print_kv(f"URL parameters ({len(plist)})", plist[:40], C['cyan'])
+    console.print(f"\n  [dim]Sample:[/]")
+    for u in urls[:15]:
+        console.print(f"    [{C['muted']}]{mesc(u[:110])}[/]")
+    if len(urls) > 15:
+        console.print(f"    [dim]... and {len(urls) - 15} more[/]")
+    if interactive and Confirm.ask(f"  [{C['info']}]?[/] Export all {len(urls)} URLs to file?", default=False):
+        fname = f"ghost_wayback_{re.sub(r'[^A-Za-z0-9_.-]', '_', target)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        try:
+            with open(fname, "w", encoding="utf-8") as f:
+                f.write("\n".join(urls))
+            console.print(f"  [{C['accent']}]Saved → {fname}[/]")
+        except Exception as e:
+            console.print(f"  [{C['danger']}]Save failed: {e}[/]")
+    return urls
+
+# ---------------------------------------------------------------------------
+#  ASN / netblock expansion  (BGPView)
+# ---------------------------------------------------------------------------
+def _ripe(call, resource, timeout=12):
+    data = safe_get(f"https://stat.ripe.net/data/{call}/data.json",
+                    params={"resource": resource}, timeout=timeout, max_retries=2)
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        return data["data"]
+    return None
+
+def mod_asn(query):
+    section_header("ASN / NETBLOCK EXPANSION  (RIPEstat)", ">")
+    q = query.strip()
+    m = re.match(r"^(?:AS)?(\d+)$", q, re.IGNORECASE)
+    asn = int(m.group(1)) if m else None
+    if asn is None:
+        d = _ripe("searchcomplete", q)
+        suggestions = []
+        for cat in (d or {}).get("categories", []):
+            if cat.get("category") == "ASNs":
+                suggestions = cat.get("suggestions", []) or []
+        if suggestions:
+            console.print(f"  [dim]Matched ASNs for '{mesc(q)}':[/]")
+            for sug in suggestions[:10]:
+                console.print(f"    [{C['purple']}]{mesc(str(sug.get('value')))}[/] "
+                              f"[dim]{mesc(str(sug.get('description', '')))}[/]")
+            m2 = re.match(r"^AS?(\d+)$", str(suggestions[0].get("value", "")), re.IGNORECASE)
+            asn = int(m2.group(1)) if m2 else None
+        if asn is None:
+            console.print(f"  [{C['warn']}]No ASN found for '{mesc(q)}'. Try 'AS15169' or a more specific org name.[/]")
+            return []
+    ov = _ripe("as-overview", f"AS{asn}")
+    holder = (ov or {}).get("holder", "") or ""
+    console.print(f"  [dim]AS{asn}[/] [{C['cyan']}]{mesc(holder)}[/] [dim]— fetching announced prefixes...[/]")
+    d = _ripe("announced-prefixes", f"AS{asn}", timeout=20)
+    prefixes = (d or {}).get("prefixes", []) or []
+    if not prefixes:
+        console.print("  [dim]No prefix data[/]")
+        return []
+    v4 = [p["prefix"] for p in prefixes if p.get("prefix") and ":" not in p["prefix"]]
+    v6 = [p["prefix"] for p in prefixes if p.get("prefix") and ":" in p["prefix"]]
+    def _hosts(pref):
+        try:
+            return ipaddress.ip_network(pref, strict=False).num_addresses
+        except Exception:
+            return 0
+    total_ips = sum(_hosts(p) for p in v4)
+    t = Table(box=box.MINIMAL, show_header=True, header_style=f"bold {C['accent']}", padding=(0, 2))
+    t.add_column("IPv4 PREFIX", style=C['cyan'])
+    t.add_column("HOSTS", style=C['white'], justify="right")
+    for pref in v4[:80]:
+        t.add_row(pref, f"{_hosts(pref):,}")
+    console.print(Padding(t, (0, 2)))
+    console.print(f"\n  [dim]AS{asn} {mesc(holder)}: {len(v4)} IPv4 prefixes "
+                  f"({total_ips:,} addresses), {len(v6)} IPv6 prefixes[/]")
+    if len(v4) > 80:
+        console.print(f"  [dim]... {len(v4) - 80} more IPv4 prefixes (full set in return value)[/]")
+    return v4 + v6
+
+# ---------------------------------------------------------------------------
+#  Exposure / misconfig scan  (nuclei-lite)
+# ---------------------------------------------------------------------------
+_EXPOSURES = [
+    ("/.git/config",              "Exposed .git repository",     r"\[core\]|repositoryformatversion"),
+    ("/.env",                     "Exposed .env secrets",        r"(APP_KEY|DB_PASSWORD|SECRET|AWS_ACCESS|API_KEY)\s*="),
+    ("/.aws/credentials",         "Exposed AWS credentials",     r"aws_access_key_id"),
+    ("/config.php.bak",           "Backup config file",          r"(password|db_|define\()"),
+    ("/server-status",            "Apache mod_status exposed",   r"Apache Server Status"),
+    ("/actuator/env",             "Spring Boot actuator exposed", r'"(propertySources|activeProfiles)"'),
+    ("/phpinfo.php",              "phpinfo() exposed",           r"phpinfo\(\)|<title>PHP "),
+    ("/.well-known/security.txt", "security.txt present",        r"(?i)contact\s*:"),
+    ("/wp-login.php",             "WordPress login exposed",     r"(?i)wordpress|wp-submit"),
+    ("/.svn/entries",             "Exposed .svn directory",      r"^\d+[\r\n]|svn:"),
+    ("/backup.sql",               "Exposed SQL backup",          r"(INSERT INTO|CREATE TABLE)"),
+    ("/.DS_Store",                "Exposed .DS_Store",           r"Bud1|\x00\x00\x00"),
+]
+_SEC_HEADERS = [
+    ("strict-transport-security", "HSTS"),
+    ("content-security-policy",   "CSP"),
+    ("x-frame-options",           "X-Frame-Options"),
+    ("x-content-type-options",    "X-Content-Type-Options"),
+    ("referrer-policy",           "Referrer-Policy"),
+    ("permissions-policy",        "Permissions-Policy"),
+]
+
+def mod_exposures(target):
+    section_header("EXPOSURE / MISCONFIG SCAN  (nuclei-lite)", ">")
+    base = target.strip()
+    if not base.startswith(("http://", "https://")):
+        probe = http_probe_one(base)
+        base = probe["url"] if probe else "https://" + base
+    parsed = urlparse(base)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    console.print(f"  [dim]Target base: {mesc(root)}[/]")
+    r = _raw_get(root)
+    if r is not None:
+        hl = {k.lower(): v for k, v in r.headers.items()}
+        present = [label for key, label in _SEC_HEADERS if key in hl]
+        missing = [label for key, label in _SEC_HEADERS if key not in hl]
+        print_kv("Security headers", present or ["(none)"], C['accent'])
+        if missing:
+            print_kv("Missing headers", missing, C['warn'])
+        score = int(100 * len(present) / len(_SEC_HEADERS))
+        col = C['danger'] if score < 34 else (C['warn'] if score < 67 else C['accent'])
+        print_kv("Header hygiene", f"{score}%", col)
+        if hl.get("server"):
+            print_kv("Server banner leak", hl["server"], C['warn'])
+        if hl.get("x-powered-by"):
+            print_kv("X-Powered-By leak", hl["x-powered-by"], C['warn'])
+    console.print(f"\n  [dim]Probing {len(_EXPOSURES)} sensitive paths...[/]")
+    findings = []
+    def check(item):
+        path, label, pat = item
+        try:
+            rr = _raw_get(root + path, allow_redirects=False)
+            if rr is not None and rr.status_code == 200 and rr.text and re.search(pat, rr.text[:8000]):
+                return (path, label, rr.status_code, len(rr.content))
+        except Exception:
+            return None
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        for res in ex.map(check, _EXPOSURES):
+            if res:
+                findings.append(res)
+    if findings:
+        console.print(f"  [bold {C['danger']}]>> {len(findings)} EXPOSURE(S) FOUND <<[/]")
+        for path, label, code, ln in findings:
+            console.print(f"    [{C['danger']}](!)[/] [{C['white']}]{mesc(label)}[/] "
+                          f"[dim]{mesc(root + path)} ({code}, {ln}B)[/]")
+    else:
+        console.print(f"  [{C['accent']}]No obvious exposed files / misconfigurations found.[/]")
+    return findings
+
+# ---------------------------------------------------------------------------
+#  Full report export  (JSON + HTML + Markdown)
+# ---------------------------------------------------------------------------
+def _report_md(rep):
+    s = rep["sections"]
+    L = [f"# Recon Report — {rep['target']}", "",
+         f"- **IP:** {rep['ip']}",
+         f"- **Domain:** {rep.get('domain') or '—'}",
+         f"- **Generated:** {rep['generated']}", ""]
+    if "geolocation" in s:
+        g = s["geolocation"]
+        L += ["## Geolocation",
+              f"- Location: {g.get('city')}, {g.get('regionName')}, {g.get('country')}",
+              f"- ISP: {g.get('isp')} | Org: {g.get('org')} | AS: {g.get('as')}", ""]
+    if s.get("open_ports"):
+        L += ["## Open Ports"] + [f"- **{p['port']}** {p['banner']}" for p in s["open_ports"]] + [""]
+    if "shodan" in s:
+        sh = s["shodan"]
+        L += ["## Shodan InternetDB", f"- Ports: {sh.get('ports')}", f"- CVEs: {sh.get('vulns')}", ""]
+    if "tls" in s:
+        L += ["## TLS"] + [f"- {k}: {v}" for k, v in s["tls"].items()] + [""]
+    if "http" in s:
+        h = s["http"]
+        L += ["## HTTP", f"- URL: {h.get('url')} ({h.get('status')})",
+              f"- Server: {h.get('server')} | Tech: {', '.join(h.get('tech', []))}",
+              f"- Title: {h.get('title')}", ""]
+    if "favicon" in s:
+        L += ["## Favicon", f"- {s['favicon']['shodan_dork']}", ""]
+    if "dns" in s:
+        L += ["## DNS"] + [f"- {k}: {', '.join(v)}" for k, v in s["dns"].items() if v] + [""]
+    if "subdomains" in s:
+        sub = s["subdomains"]
+        L += [f"## Subdomains ({sub['count']})", f"- Sources: {sub['sources']}"]
+        L += [f"- {h}" for h in sub["hosts"][:1000]] + [""]
+    if "exposures" in s and s["exposures"]:
+        L += ["## Exposures"] + [f"- **{lbl}** — {p}" for p, lbl, _c, _n in s["exposures"]] + [""]
+    return "\n".join(L)
+
+def _report_html(rep):
+    import html as _h
+    def e(x): return _h.escape(str(x))
+    s = rep["sections"]
+    parts = []
+    def sec(title, inner):
+        parts.append(f"<section><h2>{e(title)}</h2>{inner}</section>")
+    def kv(d):
+        return "<table>" + "".join(f"<tr><th>{e(k)}</th><td>{e(v)}</td></tr>" for k, v in d.items()) + "</table>"
+    if "geolocation" in s:
+        g = s["geolocation"]
+        sec("Geolocation", kv({"Location": f"{g.get('city')}, {g.get('regionName')}, {g.get('country')}",
+                               "ISP": g.get("isp"), "Org": g.get("org"), "AS": g.get("as")}))
+    if s.get("open_ports"):
+        rows = "".join(f"<tr><td>{e(p['port'])}</td><td>{e(p['banner'])}</td></tr>" for p in s["open_ports"])
+        sec("Open Ports", f"<table><tr><th>Port</th><th>Banner</th></tr>{rows}</table>")
+    if "shodan" in s:
+        sh = s["shodan"]
+        sec("Shodan InternetDB", kv({"Ports": sh.get("ports"), "CVEs": sh.get("vulns"),
+                                     "CPEs": sh.get("cpes"), "Tags": sh.get("tags")}))
+    if "tls" in s:
+        sec("TLS", kv(s["tls"]))
+    if "http" in s:
+        h = s["http"]
+        sec("HTTP", kv({"URL": h.get("url"), "Status": h.get("status"), "Server": h.get("server"),
+                        "Tech": ", ".join(h.get("tech", [])), "Title": h.get("title")}))
+    if "favicon" in s:
+        sec("Favicon", kv({"Hash": s["favicon"]["hash"], "Shodan dork": s["favicon"]["shodan_dork"]}))
+    if "dns" in s:
+        sec("DNS", kv({k: ", ".join(v) for k, v in s["dns"].items() if v}))
+    if "subdomains" in s:
+        sub = s["subdomains"]
+        lis = "".join(f"<li>{e(h)}</li>" for h in sub["hosts"][:2000])
+        sec(f"Subdomains ({sub['count']})",
+            f"<p class='muted'>Sources: {e(sub['sources'])}</p><ul class='cols'>{lis}</ul>")
+    if s.get("exposures"):
+        rows = "".join(f"<tr class='bad'><td>{e(lbl)}</td><td>{e(p)}</td></tr>" for p, lbl, _c, _n in s["exposures"])
+        sec("Exposures", f"<table><tr><th>Finding</th><th>Path</th></tr>{rows}</table>")
+    css = """
+    :root{color-scheme:dark}
+    body{background:#0b0f0b;color:#d8f5d8;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0;padding:2rem}
+    h1{color:#00FF41;border-bottom:1px solid #1f2f1f;padding-bottom:.5rem}
+    h2{color:#00FFFF;margin-top:2rem;font-size:1.05rem;text-transform:uppercase;letter-spacing:.06em}
+    section{margin-bottom:1.5rem}
+    table{border-collapse:collapse;width:100%;max-width:960px}
+    th,td{text-align:left;padding:.35rem .7rem;border-bottom:1px solid #182818;vertical-align:top}
+    th{color:#7fdca0;font-weight:600;white-space:nowrap;width:1%}
+    .muted{color:#5f7f5f}
+    ul.cols{columns:3;-webkit-columns:3;list-style:none;padding:0;font-size:12px}
+    ul.cols li{color:#8fe8ff;break-inside:avoid}
+    tr.bad td{color:#ff6b6b}
+    .meta{color:#5f7f5f;font-size:12px;margin-bottom:1.5rem}
+    """
+    header = (f"<h1>GhostRecon Report — {e(rep['target'])}</h1>"
+              f"<div class='meta'>IP {e(rep['ip'])} · Domain {e(rep.get('domain') or '—')} · {e(rep['generated'])}</div>")
+    return (f"<!doctype html><html><head><meta charset='utf-8'>"
+            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>GhostRecon — {e(rep['target'])}</title><style>{css}</style></head>"
+            f"<body>{header}{''.join(parts)}</body></html>")
+
+def full_report(target):
+    os.system("clear" if os.name != "nt" else "cls")
+    console.print(Align.center(MINI_BANNER)); console.print()
+    ip, domain = resolve(target)
+    if not ip:
+        console.print(f"  [{C['danger']}]Could not resolve: {mesc(target)}[/]"); _pause(); return
+    rep = {"target": target, "ip": ip, "domain": domain,
+           "generated": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "sections": {}}
+    console.print(Panel(f"[bold {C['accent']}]FULL REPORT[/]  {mesc(target)}  →  {ip}",
+                        border_style=C['accent']))
+    geo = safe_get(f"http://ip-api.com/json/{ip}",
+                   params={"fields": "status,country,regionName,city,lat,lon,isp,org,as,query"})
+    if isinstance(geo, dict) and geo.get("status") == "success":
+        rep["sections"]["geolocation"] = geo
+    shod = mod_shodan(ip)
+    if isinstance(shod, dict) and shod:
+        rep["sections"]["shodan"] = {k: shod.get(k) for k in ("ports", "hostnames", "cpes", "tags", "vulns")}
+    ports = mod_port_scan_auto(ip)
+    rep["sections"]["open_ports"] = [{"port": p, "banner": b} for p, b in ports]
+    host_for_tls = domain or ip
+    tls_ports = [p for p, _ in ports if p in (443, 8443, 993, 995)] or [443]
+    try:
+        tls = mod_tls(host_for_tls, tls_ports[0], probe_versions=False)
+        rep["sections"]["tls"] = {k: tls.get(k) for k in
+                                  ("verified", "subject_cn", "issuer", "sans", "days_left", "cipher") if k in tls}
+    except Exception:
+        pass
+    probe = http_probe_one(host_for_tls)
+    if probe:
+        rep["sections"]["http"] = probe
+    fav, favurl = get_favicon_hash(host_for_tls)
+    if fav is not None:
+        rep["sections"]["favicon"] = {"hash": fav, "url": favurl, "shodan_dork": f"http.favicon.hash:{fav}"}
+    if domain:
+        pmap, counts = spinner_task("Aggregating passive subdomains", gather_passive_subdomains, domain)
+        rep["sections"]["subdomains"] = {"count": len(pmap), "sources": counts, "hosts": sorted(pmap)}
+        dns = {}
+        for rtype in ("A", "AAAA", "MX", "NS", "TXT"):
+            d = safe_get("https://dns.google/resolve", params={"name": domain, "type": rtype})
+            if isinstance(d, dict):
+                dns[rtype] = [a.get("data", "") for a in d.get("Answer", [])]
+        rep["sections"]["dns"] = dns
+    try:
+        exp = mod_exposures(host_for_tls)
+        if exp:
+            rep["sections"]["exposures"] = exp
+    except Exception:
+        pass
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", target)
+    base = f"ghost_report_{safe}_{stamp}"
+    outputs = {"JSON": (base + ".json", lambda: json.dumps(rep, indent=2, default=str)),
+               "HTML": (base + ".html", lambda: _report_html(rep)),
+               "Markdown": (base + ".md", lambda: _report_md(rep))}
+    section_header("REPORT SAVED", "*")
+    for label, (path, render) in outputs.items():
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(render())
+            print_kv(label, path, C['accent'])
+        except Exception as e:
+            console.print(f"  [{C['danger']}]{label} save failed: {e}[/]")
+    _pause()
+
 MENU_ITEMS = [
-    ("1", "DEEP SCAN",          "Full recon on one target  (IP + domain + TLS)"),
-    ("2", "MASS SCAN",          "Bulk scan — CVEs, ports, geo for many targets"),
-    ("3", "QUICK LOOKUP",       "Fast IP geo + Shodan + network info"),
-    ("4", "SUBDOMAIN HUNTER",   "crt.sh + wordlist brute-force + wildcard detect"),
-    ("5", "PORT SCANNER",       "nmap (-sV) if available, else multi-threaded socket"),
-    ("6", "CVE CHECK",          "Shodan InternetDB CVEs with real CVSS from NVD"),
-    ("7", "ADVANCED SEARCH",    "Full query syntax workflow (http, ssl, ports, geo)"),
-    ("8", "TLS / CERT ANALYSIS","Cert details + supported TLS versions + cipher"),
-    ("0", "EXIT",               ""),
+    ("1",  "DEEP SCAN",         "Full recon: geo, ports, TLS, subs, http, favicon, exposure"),
+    ("2",  "MASS SCAN",         "Bulk scan — CVEs, ports, geo for many targets"),
+    ("3",  "QUICK LOOKUP",      "Fast IP geo + Shodan + ASN / network info"),
+    ("4",  "SUBDOMAIN HUNTER",  "6 passive sources + wordlist brute-force + wildcard"),
+    ("5",  "PORT SCANNER",      "nmap (-sV) if available, else multi-threaded socket"),
+    ("6",  "CVE CHECK",         "Shodan InternetDB CVEs with real CVSS from NVD"),
+    ("7",  "ADVANCED SEARCH",   "Full query syntax workflow (http, ssl, ports, geo)"),
+    ("8",  "TLS / CERT",        "Cert details + supported TLS versions + cipher"),
+    ("9",  "HTTP PROBE",        "httpx-lite: live hosts, status, tech, titles"),
+    ("10", "WAYBACK URLS",      "Harvest archived URLs, params & files (archive.org)"),
+    ("11", "ASN / NETBLOCKS",   "Expand an ASN or org into all its IP prefixes"),
+    ("12", "EXPOSURE SCAN",     "nuclei-lite: secrets, misconfigs, security headers"),
+    ("13", "FAVICON HASH",      "Shodan favicon pivot (mmh3)"),
+    ("14", "FULL REPORT",       "Run everything → JSON + HTML + Markdown report"),
+    ("0",  "EXIT",              ""),
 ]
 def print_menu():
     os.system("clear" if os.name != "nt" else "cls")
@@ -1340,11 +2110,11 @@ def print_menu():
     console.print()
     for num, name, desc in MENU_ITEMS:
         if num == "0":
-            console.print(f"  [{C['muted']}]  [{num}]  {name}[/]")
+            console.print(f"  [{C['muted']}][ 0] {name}[/]")
         else:
             console.print(
-                f"  [{C['muted']}][[/][bold {C['accent']}]{num}[/][{C['muted']}]][/] "
-                f"[bold {C['white']}]{name:<22}[/]"
+                f"  [{C['muted']}][[/][bold {C['accent']}]{num:>2}[/][{C['muted']}]][/] "
+                f"[bold {C['white']}]{name:<18}[/]"
                 f"[{C['muted']}]{desc}[/]"
             )
     console.print()
@@ -1431,6 +2201,55 @@ def main():
                     except Exception as e:
                         console.print(f"  [{C['danger']}]TLS analysis failed: {e}[/]")
                     _pause()
+            elif choice == "9":
+                t = _input_target("Enter host(s) — comma-separated, or a single domain")
+                if t:
+                    os.system("clear" if os.name != "nt" else "cls")
+                    console.print(Align.center(MINI_BANNER)); console.print()
+                    if "," in t:
+                        hosts = [x.strip() for x in t.split(",") if x.strip()]
+                    else:
+                        hosts = [t]
+                        _ip, dom = resolve(t)
+                        if dom and Confirm.ask(
+                            f"  [{C['info']}]?[/] Also enumerate + probe passive subdomains of {dom}?", default=True):
+                            pmap, _c = spinner_task("Gathering passive subdomains", gather_passive_subdomains, dom)
+                            hosts = sorted(set(hosts) | set(pmap))
+                    mod_http_probe(hosts)
+                    _pause()
+            elif choice == "10":
+                t = _input_target("Enter domain (e.g. example.com)")
+                if t:
+                    os.system("clear" if os.name != "nt" else "cls")
+                    console.print(Align.center(MINI_BANNER)); console.print()
+                    mod_wayback(t)
+                    _pause()
+            elif choice == "11":
+                q = _input_target("Enter ASN (e.g. AS15169) or org name (e.g. cloudflare)")
+                if q:
+                    os.system("clear" if os.name != "nt" else "cls")
+                    console.print(Align.center(MINI_BANNER)); console.print()
+                    mod_asn(q)
+                    _pause()
+            elif choice == "12":
+                t = _input_target("Enter target URL or host")
+                if t:
+                    os.system("clear" if os.name != "nt" else "cls")
+                    console.print(Align.center(MINI_BANNER)); console.print()
+                    console.print(f"  [{C['warn']}]Active checks — only scan hosts you are authorized to test.[/]")
+                    mod_exposures(t)
+                    _pause()
+            elif choice == "13":
+                t = _input_target("Enter host / domain")
+                if t:
+                    os.system("clear" if os.name != "nt" else "cls")
+                    console.print(Align.center(MINI_BANNER)); console.print()
+                    mod_favicon(t)
+                    _pause()
+            elif choice == "14":
+                t = _input_target()
+                if t:
+                    full_report(t)
             elif choice == "0":
                 console.print(f"\n  [{C['accent']}]Stay ghostly.[/]\n")
                 sys.exit(0)
